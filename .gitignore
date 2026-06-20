@@ -1,0 +1,12 @@
+# Arduino-Build-Artefakte (per "Sketch > Kompilierte Binärdatei exportieren")
+build/
+*.bin
+*.elf
+*.map
+*.hex
+*.d
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
