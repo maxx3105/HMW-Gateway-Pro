@@ -25,7 +25,8 @@ const int      PIN_CONFIG = 0;
 const char*    AP_PASS    = "hmwgwconfig";
 const int      RS485_RX   = 16;
 const int      RS485_TX   = 17;
-const int      RS485_DE   = -1;
+const int      RS485_DE   = -1;        // GPIO fuer DE/RE (-1 = Auto-Direction-Modul, kein DE)
+const bool     RS485_DE_INV = true;  // false = DE/RE direkt am GPIO (aktiv-HIGH). true = ueber Inverter (aktiv-LOW).
 const uint32_t BUS_BAUD   = 19200;
 const uint32_t PROBE_WINDOW_MS = 12;
 const uint32_t WDT_TIMEOUT_S   = 30;
@@ -60,6 +61,8 @@ volatile uint32_t lanFrames = 0;
 uint32_t        devAddr[32];
 volatile int    devCount = 0;
 char            lastEvent[48] = "-";
+uint32_t        lastQueryAddr = 0;       // Ziel der letzten Unicast-Abfrage (De-Dup fuer spurious 'e')
+uint32_t        lastQueryMs   = 0;
 
 // ============================== Helfer ====================================== //
 static String ipStr(uint32_t v) { return IPAddress(v).toString(); }
@@ -84,48 +87,84 @@ void sendLan(WiFiClient& cli, lgw::Crypto* cr, const uint8_t* lan, size_t ln) {
 }
 
 // ============================== Web-Seiten ================================== //
+const char* WEB_USER = "admin";          // Benutzername fuers Web-Login (Passwort = CFG.webPass)
+// Zugriff erlaubt: im Portal (AP-PW schuetzt), wenn kein Passwort gesetzt, oder bei korrektem Login.
+bool webAuthed(AsyncWebServerRequest* r) {
+    return portalMode || CFG.webPass.length() == 0 || r->authenticate(WEB_USER, CFG.webPass.c_str());
+}
+bool authFail(AsyncWebServerRequest* r) {   // true => 401 gesendet, Handler abbrechen
+    if (webAuthed(r)) return false;
+    r->requestAuthentication();
+    return true;
+}
+
+String pageHead(const String& title, int refresh = 0) {
+    String h = F("<!DOCTYPE html><html><head><meta charset=utf-8>"
+                 "<meta name=viewport content='width=device-width,initial-scale=1'>");
+    if (refresh > 0) h += "<meta http-equiv=refresh content=" + String(refresh) + ">";
+    h += F("<style>"
+           ":root{--bg:#eef1f4;--card:#fff;--fg:#23272e;--mut:#6b7280;--line:#e4e7eb;--acc:#2c6fb3;--ok:#2e7d32;--bad:#c62828}"
+           "*{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:1em}"
+           ".card{max-width:34em;margin:1em auto;background:var(--card);border-radius:12px;box-shadow:0 1px 5px #0001;padding:1.1em 1.3em}"
+           "h1{font-size:1.25em;margin:0 0 .2em}h2{font-size:.82em;text-transform:uppercase;letter-spacing:.04em;color:var(--acc);margin:1.3em 0 .3em}"
+           "table{border-collapse:collapse;width:100%}td{padding:.38em .3em;border-bottom:1px solid var(--line)}"
+           "td:first-child{color:var(--mut);width:11em}tr:last-child td{border-bottom:0}"
+           "label{display:block;margin:.5em 0 .12em;font-weight:600;font-size:.9em}"
+           "input{width:100%;padding:.45em;border:1px solid #cfd4da;border-radius:7px;font-size:1em}"
+           "input[type=checkbox]{width:auto;margin-right:.45em;vertical-align:-1px}"
+           ".badge{display:inline-block;padding:.08em .65em;border-radius:1em;color:#fff;font-size:.82em;font-weight:700}"
+           ".ok{background:var(--ok)}.bad{background:var(--bad)}"
+           "button{margin-top:1.3em;padding:.6em 1.5em;background:var(--acc);color:#fff;border:0;border-radius:7px;font-size:1em;cursor:pointer}"
+           "a{color:var(--acc);text-decoration:none}.links{margin-top:1.3em;font-size:.95em}"
+           "</style><title>");
+    h += title;
+    h += F("</title></head><body><div class=card><h1>HMW-LGW</h1>");
+    return h;
+}
+String pageFoot() { return F("</div></body></html>"); }
+
 String formHtml() {
-    String h = F("<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-                 "<title>HMW-LGW Setup</title><style>body{font-family:sans-serif;max-width:30em;margin:1em auto;padding:0 1em}"
-                 "label{display:block;margin:.6em 0 .15em;font-weight:600}input{width:100%;padding:.4em;box-sizing:border-box}"
-                 "button{margin-top:1.2em;padding:.6em 1.2em}</style></head><body><h2>HMW-LGW &ndash; Setup</h2>"
-                 "<form method=POST action=/save>");
-    h += "<label>WLAN SSID</label><input name=ssid value='" + esc(CFG.ssid) + "'>";
-    h += "<label>WLAN Passwort</label><input name=pass type=password value='" + esc(CFG.pass) + "'>";
+    String h = pageHead("HMW-LGW Setup");
+    h += F("<form method=POST action=/save><h2>WLAN</h2>");
+    h += "<label>SSID</label><input name=ssid value='" + esc(CFG.ssid) + "'>";
+    h += "<label>Passwort</label><input name=pass type=password value='" + esc(CFG.pass) + "'>";
+    h += F("<h2>LGW / Identit&auml;t</h2>");
     h += "<label>Serial / Hostname</label><input name=serial value='" + esc(CFG.serial) + "'>";
-    h += "<label>AES-Passphrase</label><input name=pass2 value='" + esc(CFG.passphrase) + "'>";
-    h += "<label><input type=checkbox name=aes " + String(CFG.useAes ? "checked" : "") + "> AES-Verschluesselung aktiv</label>";
     h += "<label>LGW-Port</label><input name=port type=number value='" + String(CFG.port) + "'>";
-    h += "<label><input type=checkbox name=staticip " + String(CFG.useStaticIp ? "checked" : "") + "> feste IP</label>";
+    h += F("<h2>AES</h2>");
+    h += "<label>Passphrase (Sicherheitsschl&uuml;ssel)</label><input name=pass2 value='" + esc(CFG.passphrase) + "'>";
+    h += "<label><input type=checkbox name=aes " + String(CFG.useAes ? "checked" : "") + "> AES-Verschl&uuml;sselung aktiv</label>";
+    h += F("<h2>Netzwerk</h2>");
+    h += "<label><input type=checkbox name=staticip " + String(CFG.useStaticIp ? "checked" : "") + "> feste IP statt DHCP</label>";
     h += "<label>IP</label><input name=ip value='" + ipStr(CFG.ip) + "'>";
     h += "<label>Gateway</label><input name=gw value='" + ipStr(CFG.gw) + "'>";
     h += "<label>Subnetz</label><input name=sn value='" + ipStr(CFG.sn) + "'>";
-    h += F("<hr><b>Verbindungs-&Uuml;berwachung</b>");
+    h += F("<h2>Verbindungs-&Uuml;berwachung</h2>");
     h += "<label>CCU-Inaktivit&auml;ts-Timeout (s, 20&ndash;600)</label><input name=rxto type=number value='" + String(CFG.rxTimeoutS) + "'>";
     h += "<label><input type=checkbox name=ka " + String(CFG.useKeepAlive ? "checked" : "") + "> TCP-Keepalive (toten Peer aktiv erkennen)</label>";
     h += "<label>Keepalive Idle (s)</label><input name=kaidle type=number value='" + String(CFG.kaIdleS) + "'>";
     h += "<label>Keepalive Intervall (s)</label><input name=kaintvl type=number value='" + String(CFG.kaIntvlS) + "'>";
     h += "<label>Keepalive Count</label><input name=kacnt type=number value='" + String(CFG.kaCount) + "'>";
     h += "<label>Unicast-Antwort-Wartezeit (ms, 50&ndash;2000)</label><input name=ackwait type=number value='" + String(CFG.ackWaitMs) + "'>";
-    h += F("<button type=submit>Speichern &amp; Neustart</button></form></body></html>");
+    h += F("<h2>Web-Login</h2>");
+    h += "<label>Passwort (leer = kein Login &middot; Benutzer = <b>admin</b>)</label><input name=webpass type=password value='" + esc(CFG.webPass) + "'>";
+    h += F("<button type=submit>Speichern &amp; Neustart</button></form>"
+           "<div class=links><a href=/>&larr; Status</a></div>");
+    h += pageFoot();
     return h;
 }
 
 String statusHtml() {
     uint32_t up = (millis() - bootMs) / 1000;
-    String h = F("<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-                 "<meta http-equiv=refresh content=5><title>HMW-LGW Status</title>"
-                 "<style>body{font-family:sans-serif;max-width:32em;margin:1em auto;padding:0 1em}"
-                 "table{border-collapse:collapse;width:100%}td{padding:.3em .5em;border-bottom:1px solid #ccc}"
-                 "td:first-child{font-weight:600;width:11em}a{display:inline-block;margin-top:1em}</style></head>"
-                 "<body><h2>HMW-LGW &ndash; Status</h2><table>");
+    String h = pageHead("HMW-LGW Status", 5);
+    h += F("<table>");
     auto row = [&](const String& k, const String& v) { h += "<tr><td>" + k + "</td><td>" + v + "</td></tr>"; };
     row("Serial/Host", esc(CFG.serial));
     row("IP",          WiFi.localIP().toString());
     row("WLAN",        esc(WiFi.SSID()) + " (" + String(WiFi.RSSI()) + " dBm)");
     row("AES",         CFG.useAes ? "an" : "aus");
     row("LGW-Port",    String(CFG.port));
-    row("CCU",         ccuConn ? "verbunden" : "getrennt");
+    row("CCU",         ccuConn ? "<span class='badge ok'>verbunden</span>" : "<span class='badge bad'>getrennt</span>");
     if (ccuConn) { char rb[16]; snprintf(rb, sizeof(rb), "%lu s", (unsigned long)((millis() - lastCcuRxMs) / 1000));
                    row("Letztes CCU-RX vor", rb); }
     row("Geraete",     String(devCount));
@@ -138,22 +177,27 @@ String statusHtml() {
                           (unsigned long)((up/60)%60),(unsigned long)(up%60));
     row("Uptime",      ut);
     row("Freier Heap", String(ESP.getFreeHeap()) + " B");
-    h += F("</table><a href=/config>Konfiguration aendern</a> &nbsp; <a href=/update>Firmware-Update</a></body></html>");
+    h += F("</table><div class=links><a href=/config>Konfiguration &auml;ndern</a> &middot; <a href=/update>Firmware-Update</a></div>");
+    h += pageFoot();
     return h;
 }
 
 String updateHtml() {
-    return F("<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-             "<title>OTA</title><style>body{font-family:sans-serif;max-width:30em;margin:1em auto;padding:0 1em}</style></head>"
-             "<body><h2>Firmware-Update</h2><form method=POST action=/update enctype='multipart/form-data'>"
-             "<input type=file name=fw accept='.bin'><br><br><button type=submit>Hochladen &amp; Flashen</button></form>"
-             "<p>.bin in Arduino: <i>Sketch &gt; Kompilierte Binaerdatei exportieren</i> (liegt dann im Sketch-Ordner).</p>"
-             "<a href=/>zurueck</a></body></html>");
+    String h = pageHead("Firmware-Update");
+    h += F("<h2>Firmware-Update</h2>"
+           "<form method=POST action=/update enctype='multipart/form-data'>"
+           "<input type=file name=fw accept='.bin'>"
+           "<button type=submit>Hochladen &amp; Flashen</button></form>"
+           "<p style='color:var(--mut);font-size:.9em'>.bin in Arduino: <i>Sketch &rarr; Kompilierte Bin&auml;rdatei exportieren</i>.</p>"
+           "<div class=links><a href=/>&larr; Status</a></div>");
+    h += pageFoot();
+    return h;
 }
 
-void handleForm  (AsyncWebServerRequest* r) { r->send(200, "text/html", formHtml()); }
-void handleStatus(AsyncWebServerRequest* r) { r->send(200, "text/html", statusHtml()); }
+void handleForm  (AsyncWebServerRequest* r) { if (authFail(r)) return; r->send(200, "text/html", formHtml()); }
+void handleStatus(AsyncWebServerRequest* r) { if (authFail(r)) return; r->send(200, "text/html", statusHtml()); }
 void handleSave  (AsyncWebServerRequest* r) {
+    if (authFail(r)) return;
     CFG.ssid = pval(r,"ssid"); CFG.pass = pval(r,"pass"); CFG.serial = pval(r,"serial");
     CFG.passphrase = pval(r,"pass2");
     CFG.useAes = r->hasParam("aes", true);
@@ -167,8 +211,12 @@ void handleSave  (AsyncWebServerRequest* r) {
     CFG.kaIntvlS    = clampU(pval(r,"kaintvl").toInt(), 1, 120);
     CFG.kaCount     = (uint8_t)clampU(pval(r,"kacnt").toInt(), 1, 20);
     CFG.ackWaitMs   = clampU(pval(r,"ackwait").toInt(), 50, 2000);
+    CFG.webPass     = pval(r,"webpass");
     cfg::save(CFG);
-    r->send(200, "text/html", "<html><body style='font-family:sans-serif'><h3>Gespeichert. Neustart...</h3></body></html>");
+    r->send(200, "text/html", pageHead("Gespeichert") +
+            F("<meta http-equiv=refresh content='7;url=/'>"
+              "<h2>Gespeichert</h2><p>Gateway startet neu &ndash; diese Seite l&auml;dt in ein paar Sekunden den Status.</p>")
+            + pageFoot());
     rebootPending = true; rebootAt = millis() + 1200;
 }
 
@@ -199,8 +247,14 @@ void watchdogBegin() {
 inline void watchdogFeed() { esp_task_wdt_reset(); }
 
 // ============================== RS485-Bus =================================== //
-inline void busTx(bool on) { if (RS485_DE >= 0) digitalWrite(RS485_DE, on ? HIGH : LOW); }
-void busSend(const uint8_t* data, size_t len) { busTx(true); Serial2.write(data, len); Serial2.flush(); busTx(false); }
+inline void busTx(bool on) { if (RS485_DE >= 0) digitalWrite(RS485_DE, (on != RS485_DE_INV) ? HIGH : LOW); }
+void busSend(const uint8_t* data, size_t len) {
+    busTx(true);
+    Serial2.write(data, len);
+    Serial2.flush();                              // wartet (modern) auf TX-Done
+    if (RS485_DE >= 0) delayMicroseconds(700);    // letztes Byte sicher draussen, bevor DE auf RX faellt
+    busTx(false);
+}
 size_t busRead(uint8_t* buf, size_t maxlen, uint32_t windowMs) {
     size_t n = 0; uint32_t last = millis();
     while (millis() - last < windowMs)
@@ -267,6 +321,8 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
     }
     if (pl[0] == lgw::CMD_SEND) {
         uint8_t mode = pl[1];
+        lastQueryAddr = ((uint32_t)pl[2]<<24)|((uint32_t)pl[3]<<16)|((uint32_t)pl[4]<<8)|pl[5];
+        lastQueryMs   = millis();
         uint8_t bus[300]; size_t bl = lgw::embeddedToBus(pl + 2, plen - 2, bus);
         dbgHex("BUS-TX(send)", bus, bl);
         busSend(bus, bl);
@@ -313,10 +369,19 @@ void pollBusEvents(WiFiClient& cli, lgw::Crypto* cr, uint32_t& lgwIdx) {
     for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START) {
         hmw::Frame f;
         if (hmw::parseFrame(rb + i, rn - i, &f) && f.target == hmw::CENTRAL && f.hasSender) {
-            snprintf(lastEvent, sizeof(lastEvent), "%08lX cmd=%02X",
-                     (unsigned long)f.sender, f.dataLen ? f.data[0] : 0);
-            uint8_t ep[290]; uint8_t epl = lgw::frameToReceived(f, ep);
-            uint8_t lan[320]; sendLan(cli, cr, lan, lgw::lanEncode((uint8_t)(++lgwIdx), ep, epl, lan));
+            // De-Dup: Antwort des gerade unicast-abgefragten Geraets NICHT als spontanes
+            // 'e' weiterreichen (kam schon als 'r'). Sonst deutet hs485d das Duplikat als
+            // Re-Announce und verheddert sich in der Inklusion. Nur quittieren.
+            bool dup = (f.sender == lastQueryAddr) && (millis() - lastQueryMs < 600);
+            if (!dup) {
+                snprintf(lastEvent, sizeof(lastEvent), "%08lX cmd=%02X",
+                         (unsigned long)f.sender, f.dataLen ? f.data[0] : 0);
+                uint8_t ep[290]; uint8_t epl = lgw::frameToReceived(f, ep);
+                uint8_t lan[320]; sendLan(cli, cr, lan, lgw::lanEncode((uint8_t)(++lgwIdx), ep, epl, lan));
+            }
+#if DEBUG_BUS
+            else Serial.printf("# (dup von %08lX unterdrueckt)\n", (unsigned long)f.sender);
+#endif
             if ((f.control & 0x03) != 0x01) busAck(f.sender, f.control);
         }
         break;
@@ -397,8 +462,8 @@ void handleClient(WiFiClient& cli) {
 
 // ============================== Gateway-Setup =============================== //
 void runGateway() {
-    if (RS485_DE >= 0) { pinMode(RS485_DE, OUTPUT); digitalWrite(RS485_DE, LOW); }
-    Serial2.begin(BUS_BAUD, SERIAL_8N1, RS485_RX, RS485_TX);
+    if (RS485_DE >= 0) { pinMode(RS485_DE, OUTPUT); busTx(false); }   // Idle = Empfangen (respektiert Invert)
+    Serial2.begin(BUS_BAUD, SERIAL_8E1, RS485_RX, RS485_TX);   // HMW-Bus = 8E1 (even parity)! Strenge HW-UARTs (z.B. ATmega32A) verwerfen sonst jeden Frame
     lgw::lanKey(CFG.passphrase.c_str(), aesKey);
 
     WiFi.persistent(false);
@@ -421,18 +486,23 @@ void runGateway() {
     webServer.on("/", HTTP_GET, handleStatus);
     webServer.on("/config", HTTP_GET, handleForm);
     webServer.on("/save", HTTP_POST, handleSave);
-    webServer.on("/update", HTTP_GET, [](AsyncWebServerRequest* r) { r->send(200, "text/html", updateHtml()); });
+    webServer.on("/update", HTTP_GET, [](AsyncWebServerRequest* r) {
+        if (authFail(r)) return; r->send(200, "text/html", updateHtml()); });
     webServer.on("/update", HTTP_POST,
         [](AsyncWebServerRequest* r) {
+            if (authFail(r)) return;
             bool ok = !Update.hasError();
-            AsyncWebServerResponse* resp = r->beginResponse(200, "text/html",
-                ok ? "<html><body style='font-family:sans-serif'><h3>Update ok &ndash; Neustart...</h3></body></html>"
-                   : "<html><body style='font-family:sans-serif'><h3>Update FEHLGESCHLAGEN</h3></body></html>");
+            String body = pageHead(ok ? "Update ok" : "Update fehlgeschlagen") +
+                (ok ? F("<meta http-equiv=refresh content='8;url=/'><h2>Update ok</h2>"
+                        "<p>Gateway startet neu &ndash; Status l&auml;dt gleich.</p>")
+                    : F("<h2>Update fehlgeschlagen</h2><p><a href=/update>Nochmal versuchen</a></p>")) + pageFoot();
+            AsyncWebServerResponse* resp = r->beginResponse(200, "text/html", body);
             resp->addHeader("Connection", "close");
             r->send(resp);
             if (ok) { rebootPending = true; rebootAt = millis() + 1500; }
         },
         [](AsyncWebServerRequest* r, String fn, size_t idx, uint8_t* data, size_t len, bool fin) {
+            if (!webAuthed(r)) return;
             if (idx == 0) { Serial.printf("# Web-OTA: %s\n", fn.c_str()); Update.begin(UPDATE_SIZE_UNKNOWN); }
             if (len) Update.write(data, len);
             if (fin) { if (Update.end(true)) Serial.println("# Web-OTA ok"); else Update.printError(Serial); }

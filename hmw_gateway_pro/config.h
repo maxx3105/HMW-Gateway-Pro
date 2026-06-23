@@ -21,6 +21,7 @@ struct GwConfig {
     uint16_t kaIntvlS    = 10;            // Keepalive: Intervall zwischen Probes (s)
     uint8_t  kaCount     = 3;             // Keepalive: tote Probes bis "Verbindung tot"
     uint16_t ackWaitMs   = 400;           // max. Wartezeit auf die erste Bus-Antwort (Unicast)
+    String   webPass;                     // Web-UI-Login (leer = kein Login; Benutzer = admin)
     bool     valid       = false;         // schon konfiguriert?
 };
 
@@ -45,6 +46,7 @@ inline void load(GwConfig& c) {
     c.kaIntvlS    = p.getUShort("kaintvl", 10);
     c.kaCount     = p.getUChar("kacnt", 3);
     c.ackWaitMs   = p.getUShort("ackwait", 400);
+    c.webPass     = p.getString("webpass", "");
     p.end();
 }
 
@@ -66,6 +68,7 @@ inline void save(const GwConfig& c) {
     p.putUShort("kaintvl", c.kaIntvlS);
     p.putUChar("kacnt", c.kaCount);
     p.putUShort("ackwait", c.ackWaitMs);
+    p.putString("webpass", c.webPass);
     p.putBool("valid", true);
     p.end();
 }

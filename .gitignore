@@ -10,3 +10,10 @@ build/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Sensible Mitschnitte / Krypto-Tools -- NICHT veroeffentlichen (AES-Key/CCU-Traffic)
+Wireshark/
+*.pcap
+*.pcapng
+lan_parse.py
+lgw_*.txt
