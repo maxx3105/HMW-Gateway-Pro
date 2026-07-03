@@ -3,10 +3,16 @@
  *
  * Protokoll-Logik aus hmw_protocol.h / hmw_lgw.h (verifiziert).
  * Features: NVS-Config, Captive-Portal, Gateway aus CFG, OTA, AES abschaltbar,
- *           Status-Webseite, Watchdog.
+ *           Status-Webseite, Watchdog, WLAN ODER Ethernet (ESP32-ETH01/LAN8720).
  * Libraries: "ESP Async WebServer" (ESP32Async) + "Async TCP".
+ *
+ * ESP32-ETH01 (WT32-ETH01): Ethernet im Portal anhaken; RS485 an die Header-Pins
+ * RXD=GPIO5 / TXD=GPIO17 (GPIO16 schaltet dort den 50-MHz-PHY-Oszillator, GPIO0
+ * traegt den RMII-Takt -- beide tabu). Kein BOOT-Taster: Portal oeffnet bei
+ * leerer Config oder wenn das Netz 20 s nicht kommt (WLAN-AP HMW-GW-xxxx).
  */
 #include <WiFi.h>
+#include <ETH.h>
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoOTA.h>
@@ -23,13 +29,21 @@
 
 const int      PIN_CONFIG = 0;
 const char*    AP_PASS    = "hmwgwconfig";
-const int      RS485_RX   = 16;
-const int      RS485_TX   = 17;
-const int      RS485_DE   = -1;        // GPIO fuer DE/RE (-1 = Auto-Direction-Modul, kein DE)
-const bool     RS485_DE_INV = true;  // false = DE/RE direkt am GPIO (aktiv-HIGH). true = ueber Inverter (aktiv-LOW).
+// RS485-Pins liegen jetzt in der NVS-Config (Portal bzw. /config), Defaults in config.h:
+// DevKit RX16/TX17 -- ESP32-ETH01 RX5/TX17, DE -1 = Auto-Direction-Modul.
 const uint32_t BUS_BAUD   = 19200;
 const uint32_t PROBE_WINDOW_MS = 12;
 const uint32_t WDT_TIMEOUT_S   = 30;
+
+// --- Ethernet-PHY (nur bei CFG.useEth aktiv). Werte = ESP32-ETH01 / WT32-ETH01
+//     (LAN8720 an RMII). Andere LAN8720-Boards hier anpassen, z.B. Olimex
+//     ESP32-POE: ADDR 0, POWER 12, CLK ETH_CLOCK_GPIO17_OUT.
+const int ETH01_PHY_ADDR  = 1;
+const int ETH01_PIN_POWER = 16;        // Enable des externen 50-MHz-Oszillators
+const int ETH01_PIN_MDC   = 23;
+const int ETH01_PIN_MDIO  = 18;
+#define   ETH01_PHY_TYPE    ETH_PHY_LAN8720
+#define   ETH01_CLK_MODE    ETH_CLOCK_GPIO0_IN
 
 // --- Bus-Diagnose: zeigt LAN-Kommandos + jedes Bus-TX/RX hex auf der Seriellen.
 //     Fuer den ersten Heim-Bus-Test an; danach auf 0 setzen.
@@ -125,7 +139,10 @@ String pageFoot() { return F("</div></body></html>"); }
 
 String formHtml() {
     String h = pageHead("HMW-LGW Setup");
-    h += F("<form method=POST action=/save><h2>WLAN</h2>");
+    h += F("<form method=POST action=/save><h2>Netzwerk-Interface</h2>");
+    h += "<label><input type=checkbox name=eth " + String(CFG.useEth ? "checked" : "") +
+         "> Ethernet statt WLAN (LAN8720, z.B. ESP32-ETH01)</label>";
+    h += F("<h2>WLAN (nur ohne Ethernet)</h2>");
     h += "<label>SSID</label><input name=ssid value='" + esc(CFG.ssid) + "'>";
     h += "<label>Passwort</label><input name=pass type=password value='" + esc(CFG.pass) + "'>";
     h += F("<h2>LGW / Identit&auml;t</h2>");
@@ -139,6 +156,12 @@ String formHtml() {
     h += "<label>IP</label><input name=ip value='" + ipStr(CFG.ip) + "'>";
     h += "<label>Gateway</label><input name=gw value='" + ipStr(CFG.gw) + "'>";
     h += "<label>Subnetz</label><input name=sn value='" + ipStr(CFG.sn) + "'>";
+    h += F("<h2>RS485-Bus</h2>");
+    h += "<label>RX-Pin (DevKit 16 &middot; ESP32-ETH01 5)</label><input name=busrx type=number value='" + String(CFG.rs485Rx) + "'>";
+    h += "<label>TX-Pin (Standard 17)</label><input name=bustx type=number value='" + String(CFG.rs485Tx) + "'>";
+    h += "<label>DE/RE-Pin (&minus;1 = Auto-Direction-Modul)</label><input name=busde type=number value='" + String(CFG.rs485De) + "'>";
+    h += "<label><input type=checkbox name=businv " + String(CFG.rs485DeInv ? "checked" : "") +
+         "> DE invertiert (aktiv-LOW, Inverter-Hardware)</label>";
     h += F("<h2>Verbindungs-&Uuml;berwachung</h2>");
     h += "<label>CCU-Inaktivit&auml;ts-Timeout (s, 20&ndash;600)</label><input name=rxto type=number value='" + String(CFG.rxTimeoutS) + "'>";
     h += "<label><input type=checkbox name=ka " + String(CFG.useKeepAlive ? "checked" : "") + "> TCP-Keepalive (toten Peer aktiv erkennen)</label>";
@@ -160,8 +183,14 @@ String statusHtml() {
     h += F("<table>");
     auto row = [&](const String& k, const String& v) { h += "<tr><td>" + k + "</td><td>" + v + "</td></tr>"; };
     row("Serial/Host", esc(CFG.serial));
-    row("IP",          WiFi.localIP().toString());
-    row("WLAN",        esc(WiFi.SSID()) + " (" + String(WiFi.RSSI()) + " dBm)");
+    row("IP",          netIp().toString());
+    if (CFG.useEth)
+        row("Ethernet", ETH.linkUp() ? String(ETH.linkSpeed()) + " Mbit/s" + (ETH.fullDuplex() ? ", Voll-Duplex" : "")
+                                     : String("<span class='badge bad'>kein Link</span>"));
+    else
+        row("WLAN",    esc(WiFi.SSID()) + " (" + String(WiFi.RSSI()) + " dBm)");
+    row("RS485-Pins",  "RX " + String(CFG.rs485Rx) + " / TX " + String(CFG.rs485Tx) +
+                       (CFG.rs485De >= 0 ? " / DE " + String(CFG.rs485De) : " / Auto-Dir"));
     row("AES",         CFG.useAes ? "an" : "aus");
     row("LGW-Port",    String(CFG.port));
     row("CCU",         ccuConn ? "<span class='badge ok'>verbunden</span>" : "<span class='badge bad'>getrennt</span>");
@@ -204,6 +233,12 @@ void handleSave  (AsyncWebServerRequest* r) {
     int port = pval(r,"port").toInt(); CFG.port = port > 0 ? (uint16_t)port : 1000;
     CFG.useStaticIp = r->hasParam("staticip", true);
     CFG.ip = parseIp(pval(r,"ip")); CFG.gw = parseIp(pval(r,"gw")); CFG.sn = parseIp(pval(r,"sn"));
+    CFG.useEth = r->hasParam("eth", true);
+    auto clampP = [](long v, long lo, long hi){ return (int8_t)(v < lo ? lo : (v > hi ? hi : v)); };
+    CFG.rs485Rx    = clampP(pval(r,"busrx").toInt(),  0, 39);
+    CFG.rs485Tx    = clampP(pval(r,"bustx").toInt(),  0, 33);   // GPIO34-39 sind input-only
+    CFG.rs485De    = clampP(pval(r,"busde").toInt(), -1, 33);
+    CFG.rs485DeInv = r->hasParam("businv", true);
     auto clampU = [](long v, long lo, long hi){ return (uint16_t)(v < lo ? lo : (v > hi ? hi : v)); };
     CFG.rxTimeoutS  = clampU(pval(r,"rxto").toInt(),   20, 600);
     CFG.useKeepAlive= r->hasParam("ka", true);
@@ -247,12 +282,12 @@ void watchdogBegin() {
 inline void watchdogFeed() { esp_task_wdt_reset(); }
 
 // ============================== RS485-Bus =================================== //
-inline void busTx(bool on) { if (RS485_DE >= 0) digitalWrite(RS485_DE, (on != RS485_DE_INV) ? HIGH : LOW); }
+inline void busTx(bool on) { if (CFG.rs485De >= 0) digitalWrite(CFG.rs485De, (on != CFG.rs485DeInv) ? HIGH : LOW); }
 void busSend(const uint8_t* data, size_t len) {
     busTx(true);
     Serial2.write(data, len);
     Serial2.flush();                              // wartet (modern) auf TX-Done
-    if (RS485_DE >= 0) delayMicroseconds(700);    // letztes Byte sicher draussen, bevor DE auf RX faellt
+    if (CFG.rs485De >= 0) delayMicroseconds(700); // letztes Byte sicher draussen, bevor DE auf RX faellt
     busTx(false);
 }
 size_t busRead(uint8_t* buf, size_t maxlen, uint32_t windowMs) {
@@ -460,12 +495,33 @@ void handleClient(WiFiClient& cli) {
     ccuConn = false;
 }
 
-// ============================== Gateway-Setup =============================== //
-void runGateway() {
-    if (RS485_DE >= 0) { pinMode(RS485_DE, OUTPUT); busTx(false); }   // Idle = Empfangen (respektiert Invert)
-    Serial2.begin(BUS_BAUD, SERIAL_8E1, RS485_RX, RS485_TX);   // HMW-Bus = 8E1 (even parity)! Strenge HW-UARTs (z.B. ATmega32A) verwerfen sonst jeden Frame
-    lgw::lanKey(CFG.passphrase.c_str(), aesKey);
+// ============================== Netzwerk ==================================== //
+// CFG.useEth: LAN8720-Ethernet (ESP32-ETH01) statt WLAN. Darunter dieselben
+// lwIP-Sockets -- LGW-Server, Web, OTA und Keepalive laufen unveraendert.
+IPAddress netIp() { return CFG.useEth ? ETH.localIP() : WiFi.localIP(); }
+bool      netUp() { return CFG.useEth ? ETH.linkUp() : (WiFi.status() == WL_CONNECTED); }
 
+bool netStart() {                       // true = IP bezogen
+    if (CFG.useEth) {
+        WiFi.mode(WIFI_OFF);            // Funk aus im Kabelbetrieb
+        WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) {
+            ETH.setHostname(CFG.serial.c_str());   // ETH_START feuert aus begin() -> vor DHCP
+        }, ARDUINO_EVENT_ETH_START);
+        bool ok =
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3,0,0)
+            ETH.begin(ETH01_PHY_TYPE, ETH01_PHY_ADDR, ETH01_PIN_MDC, ETH01_PIN_MDIO, ETH01_PIN_POWER, ETH01_CLK_MODE);
+#else       // core 2.x: gleiche Parameter, andere Reihenfolge
+            ETH.begin(ETH01_PHY_ADDR, ETH01_PIN_POWER, ETH01_PIN_MDC, ETH01_PIN_MDIO, ETH01_PHY_TYPE, ETH01_CLK_MODE);
+#endif
+        if (!ok) { Serial.println("# ETH.begin() fehlgeschlagen (PHY nicht gefunden?)"); return false; }
+        if (CFG.useStaticIp)
+            ETH.config(IPAddress(CFG.ip), IPAddress(CFG.gw), IPAddress(CFG.sn), IPAddress(CFG.gw));
+        Serial.print("# Ethernet");
+        uint32_t t0 = millis();
+        while ((uint32_t)ETH.localIP() == 0 && millis() - t0 < 20000) { delay(300); Serial.print("."); }
+        Serial.println();
+        return (uint32_t)ETH.localIP() != 0;
+    }
     WiFi.persistent(false);
     WiFi.setHostname(CFG.serial.c_str());
     WiFi.mode(WIFI_STA);
@@ -476,9 +532,23 @@ void runGateway() {
     Serial.print("# WiFi");
     uint32_t t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) { delay(300); Serial.print("."); }
-    if (WiFi.status() != WL_CONNECTED) { Serial.println("\n# WLAN fehlgeschlagen -> Portal"); startConfigPortal(); return; }
-    Serial.printf("\n# Gateway bereit: %s  Host: %s  Port %u  AES=%d\n",
-                  WiFi.localIP().toString().c_str(), WiFi.getHostname(), CFG.port, CFG.useAes);
+    Serial.println();
+    return WiFi.status() == WL_CONNECTED;
+}
+
+// ============================== Gateway-Setup =============================== //
+void runGateway() {
+    if (CFG.rs485De >= 0) { pinMode(CFG.rs485De, OUTPUT); busTx(false); }   // Idle = Empfangen (respektiert Invert)
+    Serial2.begin(BUS_BAUD, SERIAL_8E1, CFG.rs485Rx, CFG.rs485Tx);   // HMW-Bus = 8E1 (even parity)! Strenge HW-UARTs (z.B. ATmega32A) verwerfen sonst jeden Frame
+    lgw::lanKey(CFG.passphrase.c_str(), aesKey);
+
+    if (!netStart()) {
+        Serial.println(CFG.useEth ? "# Ethernet fehlgeschlagen -> Portal" : "# WLAN fehlgeschlagen -> Portal");
+        startConfigPortal(); return;
+    }
+    Serial.printf("# Gateway bereit: %s  Host: %s  Port %u  AES=%d  Netz=%s\n",
+                  netIp().toString().c_str(), CFG.serial.c_str(), CFG.port, CFG.useAes,
+                  CFG.useEth ? "Ethernet" : "WLAN");
 
     ArduinoOTA.setHostname(CFG.serial.c_str());
     ArduinoOTA.setPassword(AP_PASS);
@@ -517,8 +587,9 @@ void setup() {
     Serial.begin(115200);
     bootMs = millis();
     cfg::load(CFG);
-    Serial.printf("# Config: valid=%d ssid=%s serial=%s port=%u aes=%d\n",
-                  CFG.valid, CFG.ssid.c_str(), CFG.serial.c_str(), CFG.port, CFG.useAes);
+    Serial.printf("# Config: valid=%d ssid=%s serial=%s port=%u aes=%d eth=%d bus=RX%d/TX%d/DE%d\n",
+                  CFG.valid, CFG.ssid.c_str(), CFG.serial.c_str(), CFG.port, CFG.useAes,
+                  CFG.useEth, CFG.rs485Rx, CFG.rs485Tx, CFG.rs485De);
     if (!CFG.valid || wantConfigPortal()) startConfigPortal();
     else                                  runGateway();
 }
@@ -527,12 +598,16 @@ void loop() {
     if (rebootPending && (int32_t)(millis() - rebootAt) >= 0) { delay(100); ESP.restart(); }
     if (portalMode) { dns.processNextRequest(); return; }
     watchdogFeed();
-    static bool wifiDown = false;
-    if (WiFi.status() != WL_CONNECTED) { wifiDown = true; WiFi.reconnect(); delay(500); return; }
-    if (wifiDown) {                          // WLAN war weg, ist wieder da -> Server neu aufsetzen
-        wifiDown = false;
+    static bool netDown = false;
+    if (!netUp()) {                          // WLAN weg -> reconnect; ETH-Link weg -> auf Kabel warten
+        netDown = true;
+        if (!CFG.useEth) WiFi.reconnect();
+        delay(500); return;
+    }
+    if (netDown) {                           // Netz war weg, ist wieder da -> Server neu aufsetzen
+        netDown = false;
         lgwServer.end(); lgwServer.begin(CFG.port);
-        Serial.println("# WLAN zurueck -> LGW-Server neu gestartet");
+        Serial.println("# Netzwerk zurueck -> LGW-Server neu gestartet");
     }
     ArduinoOTA.handle();
     WiFiClient cli = lgwServer.available();

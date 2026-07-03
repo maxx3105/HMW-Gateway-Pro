@@ -5,6 +5,35 @@
 #include <Arduino.h>
 #include <Preferences.h>
 
+// --- Werks-Defaults Netz-Interface + RS485-Pins (im Sketch VOR dem Include uebersteuerbar).
+//     Mit Arduino-Board "WT32-ETH01" (= ESP32-ETH01) automatisch passend: Ethernet an,
+//     RS485 auf den Header-Pins RXD=GPIO5 / TXD=GPIO17 -- GPIO16 gehoert dort dem
+//     PHY-Oszillator! Beim generischen "ESP32 Dev Module"-Build fuer ein ETH01-Board
+//     einfach im Portal Ethernet anhaken + RX-Pin auf 5 stellen (NVS, kein Reflash).
+#ifndef DEF_USE_ETH
+  #ifdef ARDUINO_WT32_ETH01
+    #define DEF_USE_ETH  true
+  #else
+    #define DEF_USE_ETH  false
+  #endif
+#endif
+#ifndef DEF_RS485_RX
+  #ifdef ARDUINO_WT32_ETH01
+    #define DEF_RS485_RX 5
+  #else
+    #define DEF_RS485_RX 16
+  #endif
+#endif
+#ifndef DEF_RS485_TX
+  #define DEF_RS485_TX   17
+#endif
+#ifndef DEF_RS485_DE
+  #define DEF_RS485_DE   -1              // -1 = Auto-Direction-Modul (kein DE-Pin)
+#endif
+#ifndef DEF_RS485_DE_INV
+  #define DEF_RS485_DE_INV false         // true = DE ueber Inverter (aktiv-LOW)
+#endif
+
 struct GwConfig {
     String   ssid;
     String   pass;
@@ -14,6 +43,12 @@ struct GwConfig {
     uint32_t ip = 0, gw = 0, sn = 0;      // als 32-bit (IPAddress(uint32_t))
     uint16_t port        = 1000;          // LGW-Port
     bool     useAes      = true;          // AES-Verschluesselung aktiv? (false = Klartext)
+    bool     useEth      = DEF_USE_ETH;   // Ethernet (LAN8720, ESP32-ETH01) statt WLAN
+    // --- RS485-Pins (DevKit: RX16/TX17 -- ESP32-ETH01: RX5/TX17) ---
+    int8_t   rs485Rx     = DEF_RS485_RX;
+    int8_t   rs485Tx     = DEF_RS485_TX;
+    int8_t   rs485De     = DEF_RS485_DE;
+    bool     rs485DeInv  = DEF_RS485_DE_INV;
     // --- Verbindungs-Ueberwachung (zur Laufzeit ueber /config tunebar) ---
     uint16_t rxTimeoutS  = 60;            // Inaktivitaets-Timeout der CCU-Verbindung (s)
     bool     useKeepAlive= false;         // TCP-SO_KEEPALIVE -> toten Peer aktiv erkennen
@@ -40,6 +75,11 @@ inline void load(GwConfig& c) {
     c.sn          = p.getUInt("sn", 0);
     c.port        = p.getUShort("port", 1000);
     c.useAes      = p.getBool("aes", true);
+    c.useEth      = p.getBool("eth", DEF_USE_ETH);
+    c.rs485Rx     = p.getChar("busrx", DEF_RS485_RX);
+    c.rs485Tx     = p.getChar("bustx", DEF_RS485_TX);
+    c.rs485De     = p.getChar("busde", DEF_RS485_DE);
+    c.rs485DeInv  = p.getBool("businv", DEF_RS485_DE_INV);
     c.rxTimeoutS  = p.getUShort("rxto", 60);
     c.useKeepAlive= p.getBool("ka", false);
     c.kaIdleS     = p.getUShort("kaidle", 30);
@@ -62,6 +102,11 @@ inline void save(const GwConfig& c) {
     p.putUInt("sn", c.sn);
     p.putUShort("port", c.port);
     p.putBool("aes", c.useAes);
+    p.putBool("eth", c.useEth);
+    p.putChar("busrx", c.rs485Rx);
+    p.putChar("bustx", c.rs485Tx);
+    p.putChar("busde", c.rs485De);
+    p.putBool("businv", c.rs485DeInv);
     p.putUShort("rxto", c.rxTimeoutS);
     p.putBool("ka", c.useKeepAlive);
     p.putUShort("kaidle", c.kaIdleS);
