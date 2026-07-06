@@ -1,0 +1,87 @@
+# Baut die HMW-Gateway-Pro-Firmware in der Cloud und haengt die .bin an ein Release.
+#
+# Ausloeser:
+#   - Push eines Tags v*   -> baut + erstellt GitHub-Release mit der .bin (fuers Auto-Update)
+#   - workflow_dispatch     -> baut + laedt die .bin nur als Artifact hoch (zum Testen ohne Tag)
+#   - pull_request          -> reiner Build-Check (kein Release)
+#
+# Versionen sind gepinnt, damit der Cloud-Build byte-nah zum lokalen arduino-cli-Build ist
+# (esp32-Core 3.3.10, Async-Libs exakt wie lokal installiert).
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'hmw_gateway_pro/**'
+      - '.github/workflows/build.yml'
+
+env:
+  FQBN: esp32:esp32:esp32
+  ESP32_CORE_VERSION: 3.3.10
+  ASYNCTCP_VERSION: 3.4.10
+  ASYNCWEB_VERSION: 3.11.2
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write            # noetig, damit action-gh-release das Release anlegen darf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: arduino-cli einrichten
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: ESP32-Core installieren (gepinnt)
+        run: |
+          arduino-cli config init --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@${ESP32_CORE_VERSION}
+
+      - name: Bibliotheken installieren (gepinnt, ESP32Async-Forks)
+        run: |
+          arduino-cli lib install "Async TCP@${ASYNCTCP_VERSION}"
+          arduino-cli lib install "ESP Async WebServer@${ASYNCWEB_VERSION}"
+
+      - name: Firmware-Version aus dem Sketch lesen
+        id: ver
+        run: echo "version=$(grep -oP '#define FW_VERSION\s+"\K[^"]+' hmw_gateway_pro/hmw_gateway_pro.ino)" >> "$GITHUB_OUTPUT"
+
+      - name: Kompilieren
+        run: arduino-cli compile --fqbn "$FQBN" --output-dir build_ci hmw_gateway_pro
+
+      - name: .bin benennen + Pruefsumme
+        id: bin
+        run: |
+          NAME="hmw-gateway-pro-${{ steps.ver.outputs.version }}.bin"
+          cp build_ci/hmw_gateway_pro.ino.bin "$NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$NAME" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          ls -l "$NAME"
+
+      - name: Artifact hochladen (immer, zum Testen)
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ steps.ver.outputs.version }}
+          path: ${{ steps.bin.outputs.name }}
+
+      - name: Release erstellen (nur bei v*-Tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.bin.outputs.name }}
+          body: |
+            Firmware **${{ steps.ver.outputs.version }}** (Tag `${{ github.ref_name }}`)
+
+            **Web-OTA:** `.bin` herunterladen und auf der Status-Seite unter *Firmware-Update* einspielen.
+
+            | | |
+            |---|---|
+            | Datei | `${{ steps.bin.outputs.name }}` |
+            | SHA256 | `${{ steps.bin.outputs.sha256 }}` |
+            | Board | `${{ env.FQBN }}` |
+            | ESP32-Core | `${{ env.ESP32_CORE_VERSION }}` |
