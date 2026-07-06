@@ -17,6 +17,9 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoOTA.h>
 #include <Update.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <esp_task_wdt.h>
 #include <lwip/sockets.h>
 #include "config.h"
@@ -27,7 +30,13 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.0.2"
+#define FW_VERSION "1.1.0"
+
+// --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
+//     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
+//     .bin-Name folgt dem CI-Muster hmw-gateway-pro-<version>.bin.
+#define GH_OWNER "maxx3105"
+#define GH_REPO  "HMW-Gateway-Pro"
 
 // Web-Ring-Log: 1 = aktiv (jedes Serial.print* wird zusaetzlich in einen 8-KB-RAM-Ring
 // gespiegelt, abrufbar unter /log -- Anlernmitschnitt ohne USB), 0 = aus (nur UART0).
@@ -93,6 +102,17 @@ volatile int    devCount = 0;
 char            lastEvent[48] = "-";
 uint32_t        lastQueryAddr = 0;       // Ziel der letzten Unicast-Abfrage (De-Dup fuer spurious 'e')
 uint32_t        lastQueryMs   = 0;
+
+// --- Auto-Update-Status (Web-UI liest; loop schreibt). char[] statt String, weil
+//     cross-task gelesen -> kein Realloc (konsistent mit lastEvent). ---
+char            g_updLatest[16] = "";    // zuletzt ermittelte neueste Version (ohne 'v')
+char            g_updStatus[72] = "noch nicht geprueft";
+volatile bool   g_updAvail   = false;    // neuere Version verfuegbar?
+volatile bool   g_doCheckUpd = false;    // Web -> loop: Release pruefen
+volatile bool   g_doInstall  = false;    // Web -> loop: Update installieren
+static void setUpdStatus(const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); vsnprintf(g_updStatus, sizeof(g_updStatus), fmt, ap); va_end(ap);
+}
 
 // ============================== Helfer ====================================== //
 static String ipStr(uint32_t v) { return IPAddress(v).toString(); }
@@ -233,12 +253,23 @@ String statusHtml() {
 }
 
 String updateHtml() {
-    String h = pageHead("Firmware-Update");
-    h += F("<h2>Firmware-Update</h2>"
+    String h = pageHead("Firmware-Update", g_doInstall ? 8 : 0);
+    // --- Auto-Update ueber GitHub ---
+    h += F("<h2>Auto-Update (GitHub)</h2><table>");
+    h += "<tr><td>Installiert</td><td>v" FW_VERSION "</td></tr>";
+    if (strlen(g_updLatest)) h += "<tr><td>Neuestes Release</td><td>v" + esc(g_updLatest) + "</td></tr>";
+    h += "<tr><td>Status</td><td>" + esc(g_updStatus) + "</td></tr></table>";
+    h += F("<form method=POST action=/checkupdate style='display:inline'>"
+           "<button type=submit>Nach Update suchen</button></form>");
+    if (g_updAvail)
+        h += " <form method=POST action=/doupdate style='display:inline'>"
+             "<button type=submit style='background:var(--ok)'>v" + esc(g_updLatest) + " installieren</button></form>";
+    // --- manueller Upload (Fallback) ---
+    h += F("<h2>Manuell (.bin hochladen)</h2>"
            "<form method=POST action=/update enctype='multipart/form-data'>"
            "<input type=file name=fw accept='.bin'>"
            "<button type=submit>Hochladen &amp; Flashen</button></form>"
-           "<p style='color:var(--mut);font-size:.9em'>.bin in Arduino: <i>Sketch &rarr; Kompilierte Bin&auml;rdatei exportieren</i>.</p>"
+           "<p style='color:var(--mut);font-size:.9em'>.bin aus dem GitHub-Release oder lokal via CI.</p>"
            "<div class=links><a href=/>&larr; Status</a></div>");
     h += pageFoot();
     return h;
@@ -514,6 +545,10 @@ void handleClient(WiFiClient& cli) {
             Serial.println("# Neue CCU-Verbindung wartet -> alte ersetzen (last connect wins)");
             break;
         }
+        if (g_doCheckUpd || g_doInstall) {   // Update-Aktion -> Sitzung verlassen, loop fuehrt sie aus
+            Serial.println("# Update angefordert -> CCU-Sitzung verlassen");
+            break;
+        }
         while (cli.available()) {
             uint8_t enc[256]; int got = cli.read(enc, sizeof(enc));
             if (got > 0) { lastRx = millis(); lastCcuRxMs = lastRx; }
@@ -586,6 +621,61 @@ bool netStart() {                       // true = IP bezogen
     return WiFi.status() == WL_CONNECTED;
 }
 
+// ============================== Auto-Update ================================= //
+// Fragt das neueste GitHub-Release ab und vergleicht dessen Version mit FW_VERSION.
+// BLOCKIEREND (HTTPS, ~2 s) -> nur aus dem loop aufrufen, nie aus dem Async-Web-Callback.
+bool updateCheck() {
+    if (!netUp()) { setUpdStatus("kein Netz"); return false; }
+    WiFiClientSecure client; client.setInsecure();   // GitHub, kein Cert-Check; .bin-Integritaet prueft Update.h
+    HTTPClient http;
+    String url = "https://api.github.com/repos/" GH_OWNER "/" GH_REPO "/releases/latest";
+    if (!http.begin(client, url)) { setUpdStatus("begin fehlgeschlagen"); return false; }
+    http.addHeader("User-Agent", GH_REPO);            // GitHub-API verlangt einen User-Agent
+    http.addHeader("Accept", "application/vnd.github+json");
+    int code = http.GET();
+    if (code != 200) { setUpdStatus("GitHub HTTP %d", code); http.end(); return false; }
+    String body = http.getString();
+    http.end();
+    int t = body.indexOf("\"tag_name\"");
+    if (t < 0) { setUpdStatus("kein Release gefunden"); return false; }
+    int q1 = body.indexOf('"', body.indexOf(':', t) + 1);
+    int q2 = body.indexOf('"', q1 + 1);
+    if (q1 < 0 || q2 <= q1) { setUpdStatus("Parse-Fehler"); return false; }
+    String tag = body.substring(q1 + 1, q2);          // z.B. "v1.1.1"
+    String ver = tag.startsWith("v") ? tag.substring(1) : tag;
+    snprintf(g_updLatest, sizeof(g_updLatest), "%s", ver.c_str());
+    g_updAvail = (strlen(g_updLatest) > 0) && (strcmp(g_updLatest, FW_VERSION) != 0);
+    if (g_updAvail) setUpdStatus("Update verfuegbar: v%s", g_updLatest);
+    else            setUpdStatus("aktuell (v" FW_VERSION ")");
+    Serial.printf("# Update-Check: installiert v%s, neuestes v%s -> %s\n",
+                  FW_VERSION, g_updLatest, g_updAvail ? "UPDATE" : "aktuell");
+    return true;
+}
+
+// Laedt die .bin des neuesten Release und flasht sie. BLOCKIEREND (Minuten) -> nur aus
+// dem loop. Bei Erfolg kontrollierter Reboot in die neue Firmware.
+void updateInstall() {
+    if (strlen(g_updLatest) == 0) { setUpdStatus("erst pruefen"); return; }
+    String url = "https://github.com/" GH_OWNER "/" GH_REPO "/releases/download/v"
+                 + String(g_updLatest) + "/hmw-gateway-pro-" + String(g_updLatest) + ".bin";
+    Serial.printf("# Auto-Update: lade %s\n", url.c_str());
+    setUpdStatus("installiere v%s ...", g_updLatest);
+    WiFiClientSecure client; client.setInsecure();
+    httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);   // GitHub -> objects.githubusercontent.com
+    httpUpdate.rebootOnUpdate(false);                             // wir rebooten selbst
+    esp_task_wdt_delete(NULL);                                   // Download+Flash dauert Minuten -> loopTask solange nicht ueberwachen
+    t_httpUpdate_return ret = httpUpdate.update(client, url);
+    if (ret == HTTP_UPDATE_OK) {
+        Serial.println("# Auto-Update OK -> Reboot");
+        setUpdStatus("OK - Neustart ...");
+        rebootPending = true; rebootAt = millis() + 800;
+    } else {
+        esp_task_wdt_add(NULL);                                  // Update fehlgeschlagen -> WDT wieder aktiv
+        setUpdStatus("Fehler: %s", httpUpdate.getLastErrorString().c_str());
+        Serial.printf("# Auto-Update Fehler (%d): %s\n", ret, httpUpdate.getLastErrorString().c_str());
+    }
+}
+
 // ============================== Gateway-Setup =============================== //
 void runGateway() {
     if (CFG.rs485De >= 0) { pinMode(CFG.rs485De, OUTPUT); busTx(false); }   // Idle = Empfangen (respektiert Invert)
@@ -628,6 +718,17 @@ void runGateway() {
             if (len) Update.write(data, len);
             if (fin) { if (Update.end(true)) Serial.println("# Web-OTA ok"); else Update.printError(Serial); }
         });
+    // Auto-Update: Handler setzen nur Flags, die Ausfuehrung (blockierend) macht der loop.
+    webServer.on("/checkupdate", HTTP_POST, [](AsyncWebServerRequest* r) {
+        if (authFail(r)) return;
+        setUpdStatus("pruefe ..."); g_doCheckUpd = true;
+        r->redirect("/update");
+    });
+    webServer.on("/doupdate", HTTP_POST, [](AsyncWebServerRequest* r) {
+        if (authFail(r)) return;
+        if (g_updAvail) g_doInstall = true;
+        r->redirect("/update");
+    });
     webServer.begin();
     watchdogBegin();
     Serial.println("# OTA + Status-Web (Port 80) + Watchdog aktiv");
@@ -662,6 +763,8 @@ void loop() {
         Serial.println("# Netzwerk zurueck -> LGW-Server neu gestartet");
     }
     ArduinoOTA.handle();
+    if (g_doCheckUpd) { g_doCheckUpd = false; updateCheck(); }   // blockierend, aber nur zwischen CCU-Sitzungen
+    if (g_doInstall)  { g_doInstall  = false; updateInstall(); }
     WiFiClient cli = lgwServer.accept();   // accept() = ehem. available(); holt auch den in handleClient via hasClient() vorgemerkten Neu-Client
     if (cli) {
         Serial.println("# CCU verbunden");
