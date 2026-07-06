@@ -22,6 +22,24 @@
 #include "config.h"
 #include "hmw_protocol.h"
 #include "hmw_lgw.h"
+#include "log_tee.h"
+
+// --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
+//     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
+//     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
+#define FW_VERSION "1.0.2"
+
+// Web-Ring-Log: 1 = aktiv (jedes Serial.print* wird zusaetzlich in einen 8-KB-RAM-Ring
+// gespiegelt, abrufbar unter /log -- Anlernmitschnitt ohne USB), 0 = aus (nur UART0).
+// Diagnose 2026-07-05 hat bestaetigt: das Logging beeinflusst das RS485-Timing NICHT
+// (die Discovery-Aussetzer waren ein Bus-Hardware-Problem) -> standardmaessig an.
+#define WEB_LOG 1
+// Muss NACH allen System-/Lib-Includes stehen; Serial2 (RS485) ist ein eigenes Token
+// und bleibt vom #define unberuehrt. Siehe log_tee.h.
+LogTee Logger;
+#if WEB_LOG
+  #define Serial Logger
+#endif
 
 #ifndef ESP_ARDUINO_VERSION_VAL
   #define ESP_ARDUINO_VERSION_VAL(a,b,c) 0
@@ -45,18 +63,16 @@ const int ETH01_PIN_MDIO  = 18;
 #define   ETH01_PHY_TYPE    ETH_PHY_LAN8720
 #define   ETH01_CLK_MODE    ETH_CLOCK_GPIO0_IN
 
-// --- Bus-Diagnose: zeigt LAN-Kommandos + jedes Bus-TX/RX hex auf der Seriellen.
-//     Fuer den ersten Heim-Bus-Test an; danach auf 0 setzen.
-#define DEBUG_BUS 1
-#if DEBUG_BUS
+// --- Bus-Diagnose: LAN-Kommandos + jedes Bus-TX/RX als Hexdump im Log. Zur LAUFZEIT
+//     ueber die /log-Seite umschaltbar (kein Reflash noetig), Standard AUS fuer den
+//     Dauerbetrieb -> bei Bedarf (z.B. Anlern-Mitschnitt) per Web einschalten.
+volatile bool g_debugBus = false;
 static void dbgHex(const char* tag, const uint8_t* d, size_t n) {
+    if (!g_debugBus) return;
     Serial.printf("# %s [%u]", tag, (unsigned)n);
     for (size_t i = 0; i < n; i++) Serial.printf(" %02X", d[i]);
     Serial.println();
 }
-#else
-static inline void dbgHex(const char*, const uint8_t*, size_t) {}
-#endif
 
 GwConfig        CFG;
 uint8_t         aesKey[16];
@@ -90,12 +106,12 @@ static String pval(AsyncWebServerRequest* r, const char* n) {
 }
 bool wantConfigPortal() { pinMode(PIN_CONFIG, INPUT_PULLUP); delay(50); return digitalRead(PIN_CONFIG) == LOW; }
 void sendLan(WiFiClient& cli, lgw::Crypto* cr, const uint8_t* lan, size_t ln) {
-#if DEBUG_BUS
-    uint8_t c = (ln > 3) ? lan[3] : 0;   // FD | size | idx | cmd ...
-    Serial.printf("# LAN-TX '%c'(%02X) [%u]", (c >= 32 && c < 127) ? c : '.', c, (unsigned)ln);
-    for (size_t i = 0; i < ln; i++) Serial.printf(" %02X", lan[i]);
-    Serial.println();
-#endif
+    if (g_debugBus) {
+        uint8_t c = (ln > 3) ? lan[3] : 0;   // FD | size | idx | cmd ...
+        Serial.printf("# LAN-TX '%c'(%02X) [%u]", (c >= 32 && c < 127) ? c : '.', c, (unsigned)ln);
+        for (size_t i = 0; i < ln; i++) Serial.printf(" %02X", lan[i]);
+        Serial.println();
+    }
     if (cr) { uint8_t enc[320]; cr->encrypt(lan, enc, ln); cli.write(enc, ln); }
     else cli.write(lan, ln);
 }
@@ -135,7 +151,11 @@ String pageHead(const String& title, int refresh = 0) {
     h += F("</title></head><body><div class=card><h1>HMW-LGW</h1>");
     return h;
 }
-String pageFoot() { return F("</div></body></html>"); }
+String pageFoot() {
+    return F("<div style='margin-top:1.4em;font-size:.72em;color:var(--mut);text-align:center'>"
+             "HMW-LGW v" FW_VERSION " &middot; Build " __DATE__ " " __TIME__ "</div>"
+             "</div></body></html>");
+}
 
 String formHtml() {
     String h = pageHead("HMW-LGW Setup");
@@ -206,7 +226,8 @@ String statusHtml() {
                           (unsigned long)((up/60)%60),(unsigned long)(up%60));
     row("Uptime",      ut);
     row("Freier Heap", String(ESP.getFreeHeap()) + " B");
-    h += F("</table><div class=links><a href=/config>Konfiguration &auml;ndern</a> &middot; <a href=/update>Firmware-Update</a></div>");
+    row("Firmware",    F("v" FW_VERSION " &middot; " __DATE__ " " __TIME__));
+    h += F("</table><div class=links><a href=/config>Konfiguration &auml;ndern</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/update>Firmware-Update</a></div>");
     h += pageFoot();
     return h;
 }
@@ -253,6 +274,28 @@ void handleSave  (AsyncWebServerRequest* r) {
               "<h2>Gespeichert</h2><p>Gateway startet neu &ndash; diese Seite l&auml;dt in ein paar Sekunden den Status.</p>")
             + pageFoot());
     rebootPending = true; rebootAt = millis() + 1200;
+}
+
+// System-Log-Seite: zeigt den RAM-Ring (Serial-Mirror). Fuer den Anlernmitschnitt:
+// vor dem Anlernen ueber "Leeren" zuruecksetzen, dann anlernen, dann hier mitlesen.
+void handleLog(AsyncWebServerRequest* r) {
+    if (authFail(r)) return;
+    if (r->hasParam("clear")) { Logger.clear(); r->redirect("/log"); return; }
+    if (r->hasParam("debug")) { g_debugBus = (r->getParam("debug")->value().toInt() != 0); r->redirect("/log"); return; }
+    bool autoR = r->hasParam("auto");
+    String h = pageHead("System-Log", autoR ? 3 : 0);
+    h += F("<h2>System-Log</h2><div class=links>");
+    h += autoR ? F("<a href=/log>&#8635; Auto-Refresh aus</a>") : F("<a href='/log?auto'>&#8635; Auto (3s)</a>");
+    h += F(" &middot; <a href=/log>Aktualisieren</a> &middot; <a href='/log?clear'>Leeren</a>");
+    h += g_debugBus ? F(" &middot; <a href='/log?debug=0'>Bus-Debug AUS</a>")
+                    : F(" &middot; <a href='/log?debug=1'>Bus-Debug an</a>");
+    h += F(" &middot; <a href=/>&larr; Status</a></div>");
+    h += F("<pre style='white-space:pre-wrap;word-break:break-all;font-size:.78em;background:#111;color:#3f3;"
+           "padding:.7em;border-radius:8px;max-height:70vh;overflow:auto;margin-top:.8em'>");
+    h += esc(Logger.snapshot());
+    h += F("</pre>");
+    h += pageFoot();
+    r->send(200, "text/html", h);
 }
 
 void startConfigPortal() {
@@ -327,11 +370,11 @@ bool busProbe(uint32_t prefix, uint8_t validBits) {
     busSend(out, n);
     uint8_t tmp[64];
     size_t got = busRead(tmp, sizeof(tmp), PROBE_WINDOW_MS);
-#if DEBUG_BUS
-    Serial.printf("# PROBE %08lX/%u  TX=%u RX=%u\n",
-                  (unsigned long)prefix, validBits, (unsigned)n, (unsigned)got);
-    if (got) dbgHex("  PROBE-RX", tmp, got);
-#endif
+    if (g_debugBus) {
+        Serial.printf("# PROBE %08lX/%u  TX=%u RX=%u\n",
+                      (unsigned long)prefix, validBits, (unsigned)n, (unsigned)got);
+        if (got) dbgHex("  PROBE-RX", tmp, got);
+    }
     return got > 0;
 }
 void busDiscover(uint32_t prefix, int fixed, uint32_t* found, int* nf) {
@@ -345,10 +388,9 @@ void busDiscover(uint32_t prefix, int fixed, uint32_t* found, int* nf) {
 // ============================== Bridge ====================================== //
 void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl, uint8_t plen, uint32_t& lgwIdx) {
     if (plen == 0) return;
-#if DEBUG_BUS
-    Serial.printf("# LAN cmd '%c'(%02X) plen=%u\n",
-                  (pl[0] >= 32 && pl[0] < 127) ? pl[0] : '.', pl[0], plen);
-#endif
+    if (g_debugBus)
+        Serial.printf("# LAN cmd '%c'(%02X) plen=%u\n",
+                      (pl[0] >= 32 && pl[0] < 127) ? pl[0] : '.', pl[0], plen);
     uint8_t lan[320];
     if (pl[0] == lgw::CMD_KEEPALIVE) {
         uint8_t p[2] = { lgw::CMD_ALIVE, 0x00 };
@@ -369,9 +411,8 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
                     if (f.hasSender && (f.control & 0x03) != 0x01) busAck(f.sender, f.control);
                     uint8_t rp[260]; uint8_t rpl = lgw::frameToResponse(f, rp);
                     sendLan(cli, cr, lan, lgw::lanEncode(idx, rp, rpl, lan));
-#if DEBUG_BUS
-                    Serial.printf("# resp 'r' via unicast ctrl=%02X len=%u\n", f.control, f.dataLen);
-#endif
+                    if (g_debugBus)
+                        Serial.printf("# resp 'r' via unicast ctrl=%02X len=%u\n", f.control, f.dataLen);
                 }
                 break;
             }
@@ -398,9 +439,7 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
 void pollBusEvents(WiFiClient& cli, lgw::Crypto* cr, uint32_t& lgwIdx) {
     if (!Serial2.available()) return;
     uint8_t rb[256]; size_t rn = busRead(rb, sizeof(rb), 10);
-#if DEBUG_BUS
-    if (rn) dbgHex("BUS-RX(evt)", rb, rn);
-#endif
+    if (g_debugBus && rn) dbgHex("BUS-RX(evt)", rb, rn);
     for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START) {
         hmw::Frame f;
         if (hmw::parseFrame(rb + i, rn - i, &f) && f.target == hmw::CENTRAL && f.hasSender) {
@@ -414,9 +453,7 @@ void pollBusEvents(WiFiClient& cli, lgw::Crypto* cr, uint32_t& lgwIdx) {
                 uint8_t ep[290]; uint8_t epl = lgw::frameToReceived(f, ep);
                 uint8_t lan[320]; sendLan(cli, cr, lan, lgw::lanEncode((uint8_t)(++lgwIdx), ep, epl, lan));
             }
-#if DEBUG_BUS
-            else Serial.printf("# (dup von %08lX unterdrueckt)\n", (unsigned long)f.sender);
-#endif
+            else if (g_debugBus) Serial.printf("# (dup von %08lX unterdrueckt)\n", (unsigned long)f.sender);
             if ((f.control & 0x03) != 0x01) busAck(f.sender, f.control);
         }
         break;
@@ -467,6 +504,16 @@ void handleClient(WiFiClient& cli) {
     uint32_t lastRx = millis(); lastCcuRxMs = lastRx;
     while (cli.connected()) {
         watchdogFeed(); ArduinoOTA.handle();
+        // "Last connect wins": Will die CCU neu verbinden (hs485d-Neustart, Netzwechsel
+        // oder lautlos weggebrochene Verbindung), wartet ihr SYN am Listen-Socket.
+        // hasClient() akzeptiert es non-destruktiv (cached es fuer das naechste accept()
+        // im loop) -> die alte, hoechstwahrscheinlich tote Verbindung sofort aufgeben,
+        // statt bis zum rxTimeout am Zombie-Socket zu haengen. Loest das bisherige
+        // "nach CCU-Wechsel Gateway neu starten"-Problem.
+        if (lgwServer.hasClient()) {
+            Serial.println("# Neue CCU-Verbindung wartet -> alte ersetzen (last connect wins)");
+            break;
+        }
         while (cli.available()) {
             uint8_t enc[256]; int got = cli.read(enc, sizeof(enc));
             if (got > 0) { lastRx = millis(); lastCcuRxMs = lastRx; }
@@ -526,6 +573,9 @@ bool netStart() {                       // true = IP bezogen
     WiFi.setHostname(CFG.serial.c_str());
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(CFG.serial.c_str());
+    WiFi.setSleep(false);              // WLAN-Power-Save AUS: Modem-Sleep verzoegert/verwirft Pakete und
+                                       // laesst die TCP-Dauerverbindung zur CCU still abbrechen. Pflicht fuer LGW-Betrieb.
+    WiFi.setAutoReconnect(true);
     if (CFG.useStaticIp)
         WiFi.config(IPAddress(CFG.ip), IPAddress(CFG.gw), IPAddress(CFG.sn), IPAddress(CFG.gw));
     WiFi.begin(CFG.ssid.c_str(), CFG.pass.c_str());
@@ -556,6 +606,7 @@ void runGateway() {
     webServer.on("/", HTTP_GET, handleStatus);
     webServer.on("/config", HTTP_GET, handleForm);
     webServer.on("/save", HTTP_POST, handleSave);
+    webServer.on("/log", HTTP_GET, handleLog);
     webServer.on("/update", HTTP_GET, [](AsyncWebServerRequest* r) {
         if (authFail(r)) return; r->send(200, "text/html", updateHtml()); });
     webServer.on("/update", HTTP_POST,
@@ -586,6 +637,7 @@ void runGateway() {
 void setup() {
     Serial.begin(115200);
     bootMs = millis();
+    Serial.printf("# HMW-LGW Firmware v%s (Build %s %s)\n", FW_VERSION, __DATE__, __TIME__);
     cfg::load(CFG);
     Serial.printf("# Config: valid=%d ssid=%s serial=%s port=%u aes=%d eth=%d bus=RX%d/TX%d/DE%d\n",
                   CFG.valid, CFG.ssid.c_str(), CFG.serial.c_str(), CFG.port, CFG.useAes,
@@ -610,7 +662,7 @@ void loop() {
         Serial.println("# Netzwerk zurueck -> LGW-Server neu gestartet");
     }
     ArduinoOTA.handle();
-    WiFiClient cli = lgwServer.available();
+    WiFiClient cli = lgwServer.accept();   // accept() = ehem. available(); holt auch den in handleClient via hasClient() vorgemerkten Neu-Client
     if (cli) {
         Serial.println("# CCU verbunden");
         handleClient(cli);
