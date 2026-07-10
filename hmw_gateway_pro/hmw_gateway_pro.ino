@@ -30,7 +30,7 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.1.1"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
@@ -212,7 +212,10 @@ String formHtml() {
     h += F("<h2>Web-Login</h2>");
     h += "<label>Passwort (leer = kein Login &middot; Benutzer = <b>admin</b>)</label><input name=webpass type=password value='" + esc(CFG.webPass) + "'>";
     h += F("<button type=submit>Speichern &amp; Neustart</button></form>"
-           "<div class=links><a href=/>&larr; Status</a></div>");
+           "<h2>Diagnose</h2>");
+    h += g_debugBus ? F("<p>Bus-Debug: <b>AN</b> (Bus-Hexdumps im Log) &middot; <a href='/config?debug=0'>ausschalten</a></p>")
+                    : F("<p>Bus-Debug: <b>aus</b> &middot; <a href='/config?debug=1'>einschalten</a> (Bus-Hexdumps im Log)</p>");
+    h += F("<div class=links><a href=/>&larr; Status</a> &middot; <a href=/log>System-Log</a></div>");
     h += pageFoot();
     return h;
 }
@@ -253,7 +256,12 @@ String statusHtml() {
 }
 
 String updateHtml() {
-    String h = pageHead("Firmware-Update", g_doInstall ? 8 : 0);
+    // Solange ein Check/Install laeuft (Flag gesetzt ODER Status "pruefe.."/"installiere.."),
+    // automatisch nachladen -> das Ergebnis erscheint ohne manuelles F5.
+    bool busy = g_doCheckUpd || g_doInstall
+                || strncmp(g_updStatus, "pruefe", 6) == 0
+                || strncmp(g_updStatus, "installiere", 11) == 0;
+    String h = pageHead("Firmware-Update", busy ? 3 : 0);
     // --- Auto-Update ueber GitHub ---
     h += F("<h2>Auto-Update (GitHub)</h2><table>");
     h += "<tr><td>Installiert</td><td>v" FW_VERSION "</td></tr>";
@@ -275,7 +283,11 @@ String updateHtml() {
     return h;
 }
 
-void handleForm  (AsyncWebServerRequest* r) { if (authFail(r)) return; r->send(200, "text/html", formHtml()); }
+void handleForm  (AsyncWebServerRequest* r) {
+    if (authFail(r)) return;
+    if (r->hasParam("debug")) { g_debugBus = (r->getParam("debug")->value().toInt() != 0); r->redirect("/config"); return; }
+    r->send(200, "text/html", formHtml());
+}
 void handleStatus(AsyncWebServerRequest* r) { if (authFail(r)) return; r->send(200, "text/html", statusHtml()); }
 void handleSave  (AsyncWebServerRequest* r) {
     if (authFail(r)) return;
@@ -312,19 +324,15 @@ void handleSave  (AsyncWebServerRequest* r) {
 void handleLog(AsyncWebServerRequest* r) {
     if (authFail(r)) return;
     if (r->hasParam("clear")) { Logger.clear(); r->redirect("/log"); return; }
-    if (r->hasParam("debug")) { g_debugBus = (r->getParam("debug")->value().toInt() != 0); r->redirect("/log"); return; }
-    bool autoR = r->hasParam("auto");
-    String h = pageHead("System-Log", autoR ? 3 : 0);
+    bool paused = r->hasParam("pause");
+    String h = pageHead("System-Log", paused ? 0 : 3);   // Standard: alle 3 s automatisch nachladen
     h += F("<h2>System-Log</h2><div class=links>");
-    h += autoR ? F("<a href=/log>&#8635; Auto-Refresh aus</a>") : F("<a href='/log?auto'>&#8635; Auto (3s)</a>");
-    h += F(" &middot; <a href=/log>Aktualisieren</a> &middot; <a href='/log?clear'>Leeren</a>");
-    h += g_debugBus ? F(" &middot; <a href='/log?debug=0'>Bus-Debug AUS</a>")
-                    : F(" &middot; <a href='/log?debug=1'>Bus-Debug an</a>");
-    h += F(" &middot; <a href=/>&larr; Status</a></div>");
-    h += F("<pre style='white-space:pre-wrap;word-break:break-all;font-size:.78em;background:#111;color:#3f3;"
+    h += paused ? F("<a href=/log>&#8635; Live (3 s)</a>") : F("<a href='/log?pause'>&#10073;&#10073; Pause</a>");
+    h += F(" &middot; <a href=/log>Aktualisieren</a> &middot; <a href='/log?clear'>Leeren</a> &middot; <a href=/>&larr; Status</a></div>");
+    h += F("<pre id=lg style='white-space:pre-wrap;word-break:break-all;font-size:.78em;background:#111;color:#3f3;"
            "padding:.7em;border-radius:8px;max-height:70vh;overflow:auto;margin-top:.8em'>");
     h += esc(Logger.snapshot());
-    h += F("</pre>");
+    h += F("</pre><script>var e=document.getElementById('lg');e.scrollTop=e.scrollHeight;</script>");
     h += pageFoot();
     r->send(200, "text/html", h);
 }
