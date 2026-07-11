@@ -9,6 +9,7 @@
 namespace hmw {
 
 static const uint8_t  START     = 0xFD;
+static const uint8_t  START_SHORT = 0xFE;   // system/short-Frame (Booter-Antworten w/p/r/g)
 static const uint8_t  ESC       = 0xFC;
 static const uint16_t CRC_POLY  = 0x1002;
 static const uint16_t CRC_INIT  = 0xF1E2;   // == HBWired init 0xFFFF + 2 Null-Byte-Augmentation
@@ -107,6 +108,28 @@ inline bool parseFrame(const uint8_t* raw, size_t rawLen, Frame* f) {
         f->dataLen = (uint8_t)(crcPos - 7);
         memcpy(f->data, full + 7, f->dataLen);
     }
+    return true;
+}
+
+// Parst ein 0xFE-system/short-Frame (Booter-Antworten): FE destAddr(1B) control len payload... crc16.
+// Fuellt f mit control+payload (target = 1-Byte-Zieladresse, ohne sender). true bei gueltiger CRC.
+inline bool parseSystemFrame(const uint8_t* raw, size_t rawLen, Frame* f) {
+    uint8_t full[300];
+    full[0] = START_SHORT;
+    size_t fl = 1 + unescape(raw + 1, rawLen - 1, full + 1);
+    if (fl < 6) return false;                          // FE dest ctrl len + >=2 (payload/crc)
+    uint8_t ln = full[3];                              // len = payload + 2 (CRC)
+    if (ln < 2) return false;
+    size_t crcPos = (size_t)ln + 2;                    // FE(1)+dest(1)+ctrl(1)+len(1)+payload(ln-2)
+    if (crcPos + 2 > fl) return false;
+    if (crc16(full, crcPos) != (uint16_t)(((uint16_t)full[crcPos] << 8) | full[crcPos + 1]))
+        return false;
+    f->target    = full[1];
+    f->control   = full[2];
+    f->hasSender = false;
+    f->sender    = 0;
+    f->dataLen   = (uint8_t)(ln - 2);
+    memcpy(f->data, full + 4, f->dataLen);
     return true;
 }
 

@@ -30,7 +30,7 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.1.1"
+#define FW_VERSION "1.1.2"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
@@ -444,14 +444,18 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
         busSend(bus, bl);
         if (mode == lgw::MODE_UNICAST_ACK) {
             uint8_t rb[256]; size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
-            for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START) {
+            for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START || rb[i] == hmw::START_SHORT) {
                 hmw::Frame f;
-                if (hmw::parseFrame(rb + i, rn - i, &f)) {
-                    if (f.hasSender && (f.control & 0x03) != 0x01) busAck(f.sender, f.control);
+                bool isShort = (rb[i] == hmw::START_SHORT);
+                bool ok = isShort ? hmw::parseSystemFrame(rb + i, rn - i, &f)
+                                  : hmw::parseFrame(rb + i, rn - i, &f);
+                if (ok) {
+                    if (!isShort && f.hasSender && (f.control & 0x03) != 0x01) busAck(f.sender, f.control);
                     uint8_t rp[260]; uint8_t rpl = lgw::frameToResponse(f, rp);
                     sendLan(cli, cr, lan, lgw::lanEncode(idx, rp, rpl, lan));
                     if (g_debugBus)
-                        Serial.printf("# resp 'r' via unicast ctrl=%02X len=%u\n", f.control, f.dataLen);
+                        Serial.printf("# resp 'r' via %s ctrl=%02X len=%u\n",
+                                      isShort ? "system" : "unicast", f.control, f.dataLen);
                 }
                 break;
             }
