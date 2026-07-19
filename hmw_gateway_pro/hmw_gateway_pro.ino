@@ -30,7 +30,7 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.1.2"
+#define FW_VERSION "1.1.6"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
@@ -61,6 +61,7 @@ const char*    AP_PASS    = "hmwgwconfig";
 const uint32_t BUS_BAUD   = 19200;
 const uint32_t PROBE_WINDOW_MS = 12;
 const uint32_t WDT_TIMEOUT_S   = 30;
+const uint32_t BUS_CS_MAX_WAIT_MS = 100;   // Carrier-Sense: max. Wartezeit auf freien Bus (Notausstieg)
 
 // --- Ethernet-PHY (nur bei CFG.useEth aktiv). Werte = ESP32-ETH01 / WT32-ETH01
 //     (LAN8720 an RMII). Andere LAN8720-Boards hier anpassen, z.B. Olimex
@@ -102,6 +103,7 @@ volatile int    devCount = 0;
 char            lastEvent[48] = "-";
 uint32_t        lastQueryAddr = 0;       // Ziel der letzten Unicast-Abfrage (De-Dup fuer spurious 'e')
 uint32_t        lastQueryMs   = 0;
+volatile uint32_t busLastRxMs = 0;       // millis() des letzten Bus-Bytes (Carrier-Sense)
 
 // --- Auto-Update-Status (Web-UI liest; loop schreibt). char[] statt String, weil
 //     cross-task gelesen -> kein Realloc (konsistent mit lastEvent). ---
@@ -202,6 +204,9 @@ String formHtml() {
     h += "<label>DE/RE-Pin (&minus;1 = Auto-Direction-Modul)</label><input name=busde type=number value='" + String(CFG.rs485De) + "'>";
     h += "<label><input type=checkbox name=businv " + String(CFG.rs485DeInv ? "checked" : "") +
          "> DE invertiert (aktiv-LOW, Inverter-Hardware)</label>";
+    h += "<label><input type=checkbox name=cs " + String(CFG.useCarrierSense ? "checked" : "") +
+         "> Carrier-Sense (CSMA/CA: vor dem Senden auf freien Bus warten)</label>";
+    h += "<label>Bus-Idle vor dem Senden (ms, 1&ndash;100)</label><input name=busidle type=number value='" + String(CFG.busIdleMs) + "'>";
     h += F("<h2>Verbindungs-&Uuml;berwachung</h2>");
     h += "<label>CCU-Inaktivit&auml;ts-Timeout (s, 20&ndash;600)</label><input name=rxto type=number value='" + String(CFG.rxTimeoutS) + "'>";
     h += "<label><input type=checkbox name=ka " + String(CFG.useKeepAlive ? "checked" : "") + "> TCP-Keepalive (toten Peer aktiv erkennen)</label>";
@@ -234,6 +239,7 @@ String statusHtml() {
         row("WLAN",    esc(WiFi.SSID()) + " (" + String(WiFi.RSSI()) + " dBm)");
     row("RS485-Pins",  "RX " + String(CFG.rs485Rx) + " / TX " + String(CFG.rs485Tx) +
                        (CFG.rs485De >= 0 ? " / DE " + String(CFG.rs485De) : " / Auto-Dir"));
+    row("Carrier-Sense", CFG.useCarrierSense ? String(CFG.busIdleMs) + " ms Bus-Idle" : "aus");
     row("AES",         CFG.useAes ? "an" : "aus");
     row("LGW-Port",    String(CFG.port));
     row("CCU",         ccuConn ? "<span class='badge ok'>verbunden</span>" : "<span class='badge bad'>getrennt</span>");
@@ -310,6 +316,8 @@ void handleSave  (AsyncWebServerRequest* r) {
     CFG.kaIntvlS    = clampU(pval(r,"kaintvl").toInt(), 1, 120);
     CFG.kaCount     = (uint8_t)clampU(pval(r,"kacnt").toInt(), 1, 20);
     CFG.ackWaitMs   = clampU(pval(r,"ackwait").toInt(), 50, 2000);
+    CFG.useCarrierSense = r->hasParam("cs", true);
+    CFG.busIdleMs   = clampU(pval(r,"busidle").toInt(), 1, 100);
     CFG.webPass     = pval(r,"webpass");
     cfg::save(CFG);
     r->send(200, "text/html", pageHead("Gespeichert") +
@@ -372,10 +380,33 @@ void busSend(const uint8_t* data, size_t len) {
     if (CFG.rs485De >= 0) delayMicroseconds(700); // letztes Byte sicher draussen, bevor DE auf RX faellt
     busTx(false);
 }
+// CSMA/CA Carrier-Sense vor einem Master-Sendevorgang: wartet, bis der Bus mind.
+// CFG.busIdleMs am Stueck still war (max. BUS_CS_MAX_WAIT_MS), danach kurzer Zufalls-
+// Backoff gegen zeitgleichen Zugriff. NUR im CMD_SEND-Pfad aufrufen -- NICHT vor
+// busAck() (das muss unmittelbar als Antwort raus, sonst retransmittiert das Geraet)
+// und nicht in der Discovery (die hat ihr eigenes 12-ms-Fenster).
+// Laeuft beim Aufruf ausnahmsweise ein Fremd-Frame (Geraete-Event exakt zeitgleich
+// zum CCU-Kommando), wird es hier leergelesen und verworfen: das Geraet bekommt kein
+// busAck und wiederholt sein Event, die CCU wiederholt ihr Kommando mangels 'r' --
+// kein Datenverlust, nur der seltene echte Kollisionsfall kostet eine Runde. Im
+// Normalfall (Bus zum Sendezeitpunkt frei) kehrt die Funktion praktisch sofort zurueck.
+void busWaitIdle() {
+    if (!CFG.useCarrierSense) return;
+    uint32_t deadline = millis() + BUS_CS_MAX_WAIT_MS;
+    for (;;) {
+        while (Serial2.available()) { Serial2.read(); busLastRxMs = millis(); }
+        if (millis() - busLastRxMs >= CFG.busIdleMs) break;   // lang genug still -> Bus frei
+        if ((int32_t)(millis() - deadline) >= 0) {            // Bus dauerbelegt -> trotzdem senden
+            if (g_debugBus) Serial.println("# Carrier-Sense: Timeout, sende trotzdem");
+            break;
+        }
+    }
+    delayMicroseconds(esp_random() % 500);        // 0..500 us Backoff
+}
 size_t busRead(uint8_t* buf, size_t maxlen, uint32_t windowMs) {
     size_t n = 0; uint32_t last = millis();
     while (millis() - last < windowMs)
-        while (Serial2.available() && n < maxlen) { buf[n++] = Serial2.read(); last = millis(); }
+        while (Serial2.available() && n < maxlen) { buf[n++] = Serial2.read(); last = millis(); busLastRxMs = last; }
     return n;
 }
 // Wie busRead, aber wartet bis firstWaitMs auf das ERSTE Byte (Geraet hat Carrier-
@@ -384,11 +415,11 @@ size_t busRead(uint8_t* buf, size_t maxlen, uint32_t windowMs) {
 size_t busReadResponse(uint8_t* buf, size_t maxlen, uint32_t firstWaitMs, uint32_t gapMs) {
     size_t n = 0; uint32_t start = millis();
     while (n == 0 && millis() - start < firstWaitMs)
-        while (Serial2.available() && n < maxlen) buf[n++] = Serial2.read();
+        while (Serial2.available() && n < maxlen) { buf[n++] = Serial2.read(); busLastRxMs = millis(); }
     if (n == 0) return 0;
     uint32_t last = millis();
     while (millis() - last < gapMs)
-        while (Serial2.available() && n < maxlen) { buf[n++] = Serial2.read(); last = millis(); }
+        while (Serial2.available() && n < maxlen) { buf[n++] = Serial2.read(); last = millis(); busLastRxMs = last; }
     return n;
 }
 // len02-ACK an ein Geraet. Basis 0x19 + txSeqNum (Bits 6-5 des Geraete-Frames).
@@ -441,6 +472,7 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
         lastQueryMs   = millis();
         uint8_t bus[300]; size_t bl = lgw::embeddedToBus(pl + 2, plen - 2, bus);
         dbgHex("BUS-TX(send)", bus, bl);
+        busWaitIdle();                    // CSMA/CA: erst senden, wenn der Bus frei ist (falls aktiviert)
         busSend(bus, bl);
         if (mode == lgw::MODE_UNICAST_ACK) {
             uint8_t rb[256]; size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
