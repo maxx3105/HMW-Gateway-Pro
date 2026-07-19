@@ -30,7 +30,7 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.1.6"
+#define FW_VERSION "1.1.7"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
@@ -476,6 +476,10 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
         busSend(bus, bl);
         if (mode == lgw::MODE_UNICAST_ACK) {
             uint8_t rb[256]; size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
+            // Diagnose: rohe Empfangsbytes IMMER dumpen (auch wenn kein sauberes Frame),
+            // sonst sind wir blind fuer 0xFE-Booter-Antworten/CRC-Muell/Timeout.
+            if (rn) dbgHex("BUS-RX(resp)", rb, rn);
+            else if (g_debugBus) Serial.printf("# BUS-RX(resp) LEER nach %u ms\n", CFG.ackWaitMs);
             for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START || rb[i] == hmw::START_SHORT) {
                 hmw::Frame f;
                 bool isShort = (rb[i] == hmw::START_SHORT);
@@ -491,6 +495,12 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
                 }
                 break;
             }
+            // KEINE blockierende post-u-Nachlausch-Diagnose mehr! Sie hielt den Gateway-Loop
+            // nach jedem 'u' bis zu 2,5 s an (nach dem 2. u = Booter kommt nichts -> volle 2,5 s).
+            // Das direkt folgende 'p' (WriteFlash der hs485d) wurde dadurch erst nach 2,5 s
+            // gesendet -- die hs485d hat aber nur 500 ms Response-Timeout -> 'p' lief in den
+            // Timeout -> das Firmware-Update brach reproduzierbar ab. Ein spontaner Booter-
+            // Announce nach dem App-Reset wird ohnehin von pollBusEvents() gefangen.
         }
         return;
     }
@@ -760,7 +770,10 @@ void runGateway() {
             if (!webAuthed(r)) return;
             if (idx == 0) { Serial.printf("# Web-OTA: %s\n", fn.c_str()); Update.begin(UPDATE_SIZE_UNKNOWN); }
             if (len) Update.write(data, len);
-            if (fin) { if (Update.end(true)) Serial.println("# Web-OTA ok"); else Update.printError(Serial); }
+            if (fin) {
+                if (Update.end(true)) { Serial.println("# Web-OTA ok, Neustart..."); rebootPending = true; rebootAt = millis() + 1500; }
+                else Update.printError(Serial);
+            }
         });
     // Auto-Update: Handler setzen nur Flags, die Ausfuehrung (blockierend) macht der loop.
     webServer.on("/checkupdate", HTTP_POST, [](AsyncWebServerRequest* r) {
