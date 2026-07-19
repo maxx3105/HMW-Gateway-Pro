@@ -30,7 +30,7 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.1.9"
+#define FW_VERSION "1.2.0"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
@@ -115,6 +115,25 @@ volatile bool   g_doInstall  = false;    // Web -> loop: Update installieren
 static void setUpdStatus(const char* fmt, ...) {
     va_list ap; va_start(ap, fmt); vsnprintf(g_updStatus, sizeof(g_updStatus), fmt, ap); va_end(ap);
 }
+
+// --- Bus-Firmware-Update (Web -> loop): eine App-.hex ueber den RS485-Bus in ein HBWired-
+//     Geraet mit HBW-Booter flashen (z z -> u -> p -> w-Schleife -> p -> r-Verify -> g). Das
+//     Gateway ist dabei selbst Master; die CCU-Sitzung pausiert wie beim Auto-Update. ---
+volatile bool g_doBusFlash  = false;     // Web -> loop: Flash starten
+volatile bool g_doDiscover  = false;     // Web -> loop: Geraetesuche (fuellt devAddr[] fuers Dropdown)
+uint32_t      g_flashTarget = 0;         // Ziel-Busadresse des Geraets
+uint8_t*      g_flashImage  = nullptr;   // geparste .hex im Heap (64 KB), Index = Byte-Adresse
+uint32_t      g_flashLen    = 0;         // Image-Groesse = hoechste belegte Adresse + 1
+volatile bool g_flashBusy   = false;     // Flash/Discovery laeuft (Web-Auto-Refresh + Upload-Sperre)
+volatile int  g_flashPct    = 0;         // Fortschritt 0..100
+char          g_flashStatus[80] = "bereit";
+static void setFlashStatus(const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); vsnprintf(g_flashStatus, sizeof(g_flashStatus), fmt, ap); va_end(ap);
+}
+// Intel-HEX-Upload-Parser-Zustand (die .hex kommt chunk-weise, Zeilen zerbrechen an Chunk-Grenzen)
+static uint32_t g_ihexExt = 0;           // aktuelle Extended-Linear/Segment-Basis
+static char     g_ihexLine[600];         // Puffer fuer eine ':'-Zeile
+static uint16_t g_ihexPos = 0;
 
 // ============================== Helfer ====================================== //
 static String ipStr(uint32_t v) { return IPAddress(v).toString(); }
@@ -260,7 +279,7 @@ String statusHtml() {
     row("Uptime",      ut);
     row("Freier Heap", String(ESP.getFreeHeap()) + " B");
     row("Firmware",    F("v" FW_VERSION " &middot; " __DATE__ " " __TIME__));
-    h += F("</table><div class=links><a href=/config>Konfiguration &auml;ndern</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/update>Firmware-Update</a></div>");
+    h += F("</table><div class=links><a href=/config>Konfiguration &auml;ndern</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/update>Firmware-Update</a> &middot; <a href=/flash>Ger&auml;t flashen</a></div>");
     h += pageFoot();
     return h;
 }
@@ -349,6 +368,34 @@ void handleLog(AsyncWebServerRequest* r) {
     h += F("</pre><script>var e=document.getElementById('lg');e.scrollTop=e.scrollHeight;</script>");
     h += pageFoot();
     r->send(200, "text/html", h);
+}
+
+String flashHtml() {
+    bool busy = g_flashBusy || g_doBusFlash || g_doDiscover;
+    String h = pageHead("Geraet ueber Bus flashen", busy ? 2 : 0);
+    h += F("<h2>HBWired-Firmware &uuml;ber den Bus</h2>"
+           "<p style='color:var(--mut);font-size:.9em'>Flasht eine App-.hex in ein Ger&auml;t mit "
+           "HBW-Booter &ndash; ohne CCU/fwmap. Die CCU-Verbindung pausiert w&auml;hrenddessen. Der "
+           "Booter sch&uuml;tzt sich selbst (Boot-Section, CRC-Gate): ein Abbruch l&auml;sst das "
+           "Ger&auml;t im Booter, nicht defekt.</p>");
+    if (busy || g_flashPct > 0)
+        h += "<table><tr><td>Status</td><td>" + esc(g_flashStatus) + "</td></tr>"
+             "<tr><td>Fortschritt</td><td>" + String(g_flashPct) + " %</td></tr></table>";
+    if (busy) {
+        h += F("<div class=links><a href=/flash>Aktualisieren</a> &middot; <a href=/log>System-Log</a></div>");
+        return h + pageFoot();
+    }
+    h += F("<form method=POST action=/flashdiscover><button type=submit>Ger&auml;te am Bus suchen</button></form>"
+           "<form method=POST action=/flash enctype='multipart/form-data'>"
+           "<label>Ziel aus gefundenen Ger&auml;ten</label><select name=devsel>"
+           "<option value=''>-- manuell --</option>");
+    for (int i = 0; i < devCount && i < 32; i++) { char b[10]; snprintf(b, sizeof(b), "%08X", devAddr[i]); h += "<option>" + String(b) + "</option>"; }
+    h += F("</select>"
+           "<label>oder Busadresse manuell (8 Hex, z.&thinsp;B. 42FFFFFF)</label><input name=devhex placeholder='42FFFFFF'>"
+           "<label>Firmware (.hex, App unter der Boot-Section)</label><input type=file name=fw accept='.hex'>"
+           "<button type=submit>Hochladen &amp; Flashen</button></form>"
+           "<div class=links><a href=/>&larr; Status</a> &middot; <a href=/log>System-Log</a></div>");
+    return h + pageFoot();
 }
 
 void startConfigPortal() {
@@ -625,8 +672,8 @@ void handleClient(WiFiClient& cli) {
             Serial.println("# Neue CCU-Verbindung wartet -> alte ersetzen (last connect wins)");
             break;
         }
-        if (g_doCheckUpd || g_doInstall) {   // Update-Aktion -> Sitzung verlassen, loop fuehrt sie aus
-            Serial.println("# Update angefordert -> CCU-Sitzung verlassen");
+        if (g_doCheckUpd || g_doInstall || g_doBusFlash || g_doDiscover) {   // Update/Bus-Flash -> Sitzung verlassen, loop fuehrt es aus
+            Serial.println("# Update/Flash angefordert -> CCU-Sitzung verlassen");
             break;
         }
         while (cli.available()) {
@@ -756,6 +803,162 @@ void updateInstall() {
     }
 }
 
+// ======================= Bus-Firmware-Update (HBW-Booter) =================== //
+// App-CRC fuers 'g'-Kommando: CRC16 Poly 0x1002, Init 0xFFFF, bitweise (crc16Shift-Stil),
+// OHNE Augmentation -- das ist NICHT hmw::crc16 (Frame-CRC mit 0xF1E2)! Muss bit-genau der
+// appCrc() im Booter / appcrc() in flash_tool.py entsprechen, sonst verweigert 'g' den Start.
+static uint16_t appCrc16(const uint8_t* d, uint32_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint32_t k = 0; k < len; k++) {
+        uint8_t b = d[k];
+        for (uint8_t i = 0; i < 8; i++) {
+            uint8_t hi = (crc & 0x8000) ? 1 : 0;
+            crc <<= 1; if (b & 0x80) crc |= 1; if (hi) crc ^= 0x1002; b <<= 1;
+        }
+    }
+    return crc;
+}
+
+// --- Intel-HEX-Parser (inkrementell, fuer den chunk-weisen Web-Upload) ---
+static inline uint8_t hxNib(char c) { return (c <= '9') ? (uint8_t)(c - '0') : (uint8_t)((c | 0x20) - 'a' + 10); }
+static void ihexReset() { g_ihexExt = 0; g_ihexPos = 0; g_flashLen = 0; }
+static void ihexParseLine(const char* s, uint16_t n) {
+    if (n < 11 || s[0] != ':') return;                      // :LL AAAA TT [data] CC
+    auto B = [&](uint8_t i) -> uint8_t { return (uint8_t)((hxNib(s[1 + i*2]) << 4) | hxNib(s[2 + i*2])); };
+    uint8_t ll = B(0);
+    if ((uint16_t)(11 + ll * 2) > n + 1) return;            // Zeile zu kurz fuer LL Datenbytes
+    uint8_t tt = B(3);
+    if (tt == 0x00) {                                       // Datenrecord
+        uint16_t addr = ((uint16_t)B(1) << 8) | B(2);
+        for (uint8_t i = 0; i < ll; i++) {
+            uint32_t a = g_ihexExt + addr + i;
+            if (a < 0x10000) {                              // >0xFFFF (Booter/obere Bank) kann die 16-bit-w-Adresse eh nicht -> ignorieren
+                g_flashImage[a] = B(4 + i);
+                if (a + 1 > g_flashLen) g_flashLen = a + 1;
+            }
+        }
+    } else if (tt == 0x04) { g_ihexExt = ((uint32_t)(((uint16_t)B(4) << 8) | B(5))) << 16; }
+    else if (tt == 0x02) { g_ihexExt = ((uint32_t)(((uint16_t)B(4) << 8) | B(5))) << 4;  }
+}
+static void ihexFeed(const uint8_t* d, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        char c = (char)d[i];
+        if (c == '\r') continue;
+        if (c == '\n') { g_ihexLine[g_ihexPos] = 0; if (g_ihexPos) ihexParseLine(g_ihexLine, g_ihexPos); g_ihexPos = 0; }
+        else if (g_ihexPos < (uint16_t)(sizeof(g_ihexLine) - 1)) g_ihexLine[g_ihexPos++] = c;
+    }
+}
+
+// Sendet ein Booter-Kommando (control 0x18, hasSender) an das Geraet und wartet auf dessen
+// ACK-Frame (control & 7 == 1). Fuellt optional die ACK-Payload. Bis 'tries' Wiederholungen.
+static bool busTxAck(uint32_t target, const uint8_t* data, uint8_t len,
+                     uint8_t* ackPl, uint8_t* ackPlLen, uint8_t tries) {
+    uint8_t out[300];
+    size_t n = hmw::buildFrame(target, 0x18, hmw::CENTRAL, data, len, out, true);
+    for (uint8_t t = 0; t < tries; t++) {
+        while (Serial2.available()) Serial2.read();
+        busSend(out, n);
+        uint8_t rb[300];
+        size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
+        for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START) {
+            hmw::Frame f;
+            if (hmw::parseFrame(rb + i, rn - i, &f) && (f.control & 0x07) == 0x01) {
+                if (ackPl && ackPlLen) { *ackPlLen = f.dataLen; if (f.dataLen) memcpy(ackPl, f.data, f.dataLen); }
+                return true;
+            }
+            break;                                          // START, aber kein ACK -> naechster Versuch
+        }
+    }
+    return false;
+}
+
+// Die komplette Flash-Choreografie -- BLOCKIEREND, nur aus dem loop (WDT wird pausiert).
+// Portiert aus flash_tool.py. Bei Verify-Fehler wird KEIN 'g' gesendet -> Geraet bleibt im Booter.
+void busFlashRun() {
+    g_flashBusy = true; g_flashPct = 0;
+    esp_task_wdt_delete(NULL);                              // Flash dauert > WDT-Timeout
+    uint32_t tgt = g_flashTarget, total = g_flashLen;
+    Serial.printf("# Bus-Flash -> %08lX, %lu Bytes\n", (unsigned long)tgt, (unsigned long)total);
+    uint8_t pl[80], pll = 0, blk = 64;
+
+    // 1) z z -- Bus still (Broadcast, kein ACK)
+    { uint8_t z = 0x7A, out[32];
+      busSend(out, hmw::buildFrame(hmw::BROADCAST, 0x98, hmw::CENTRAL, &z, 1, out, true)); delay(30);
+      busSend(out, hmw::buildFrame(hmw::BROADCAST, 0x9C, hmw::CENTRAL, &z, 1, out, true)); delay(30); }
+
+    // 2) u -- App ACKt, macht Watchdog-Reset -> Booter (Reset dauert ~1 s); 2. u ACKt der Booter
+    setFlashStatus("Booter-Einstieg (u) ...");
+    { uint8_t u = 0x75; busTxAck(tgt, &u, 1, nullptr, nullptr, 3); }
+    delay(1500);
+    { uint8_t u = 0x75; busTxAck(tgt, &u, 1, nullptr, nullptr, 1); }
+
+    // 3) p -- Blockgroesse (ACK + [00 blk])
+    setFlashStatus("Handshake (p) ...");
+    { uint8_t p = 0x70; if (busTxAck(tgt, &p, 1, pl, &pll, 3) && pll >= 2 && pl[1]) blk = pl[1]; }
+    if (blk == 0 || blk > 64) blk = 64;
+
+    // 4) w-Schleife -- Page 0 (Reset-Vektor) ZULETZT (2 Durchgaenge: erst >=128, dann <128)
+    setFlashStatus("Schreibe ...");
+    bool ok = true;
+    for (int pass = 0; pass < 2 && ok; pass++)
+        for (uint32_t base = 0; base < total && ok; base += blk) {
+            if ((pass == 0) == (base < 128)) continue;      // Pass 0: base>=128, Pass 1: base<128
+            uint8_t chunk = (total - base < blk) ? (uint8_t)(total - base) : blk;
+            uint8_t w[4 + 64];
+            w[0] = 0x77; w[1] = base >> 8; w[2] = (uint8_t)base; w[3] = chunk;
+            memcpy(w + 4, g_flashImage + base, chunk);
+            if (!busTxAck(tgt, w, 4 + chunk, pl, &pll, 3)) {
+                ok = false; setFlashStatus("FEHLER: kein ACK @0x%04lX", (unsigned long)base);
+            }
+            g_flashPct = (int)((uint64_t)(base + chunk) * 50 / total);
+        }
+
+    // 5) p (Verify-Start, committet letzte Page im Booter) + 6) r-Verify (byte-genau)
+    if (ok) {
+        setFlashStatus("Verify ...");
+        { uint8_t p = 0x70; busTxAck(tgt, &p, 1, pl, &pll, 3); }
+        for (uint32_t base = 0; base < total && ok; base += blk) {
+            uint8_t chunk = (total - base < blk) ? (uint8_t)(total - base) : blk;
+            uint8_t r[4] = { 0x72, (uint8_t)(base >> 8), (uint8_t)base, chunk };
+            uint8_t rp[80], rpl = 0;
+            if (!busTxAck(tgt, r, 4, rp, &rpl, 3) || rpl < chunk || memcmp(rp, g_flashImage + base, chunk) != 0) {
+                ok = false; setFlashStatus("Verify-Fehler @0x%04lX", (unsigned long)base);
+            }
+            g_flashPct = 50 + (int)((uint64_t)(base + chunk) * 50 / total);
+        }
+    }
+
+    // 7) g -- CRC-Gate + App-Start (nur bei fehlerfreiem Verify)
+    if (ok) {
+        uint16_t crc = appCrc16(g_flashImage, total);
+        uint8_t g[5] = { 0x67, (uint8_t)(total >> 8), (uint8_t)total, (uint8_t)(crc >> 8), (uint8_t)crc };
+        busTxAck(tgt, g, 5, nullptr, nullptr, 2);
+        g_flashPct = 100; setFlashStatus("fertig -- Geraet startet neu (CRC %04X)", crc);
+        Serial.printf("# Bus-Flash OK (CRC %04X)\n", crc);
+    } else {
+        Serial.printf("# Bus-Flash FEHLGESCHLAGEN: %s\n", g_flashStatus);
+    }
+
+    free(g_flashImage); g_flashImage = nullptr; g_flashLen = 0;
+    esp_task_wdt_add(NULL);
+    g_flashBusy = false;
+}
+
+// Geraetesuche fuers /flash-Dropdown (Binaersuche wie CMD_DISCOVERY, fuellt devAddr[]).
+void busDiscoverRun() {
+    g_flashBusy = true;
+    esp_task_wdt_delete(NULL);
+    setFlashStatus("Suche Geraete am Bus ...");
+    uint32_t found[32]; int nf = 0;
+    busDiscover(0, 0, found, &nf);
+    for (int i = 0; i < nf && i < 32; i++) devAddr[i] = found[i];
+    devCount = nf;
+    setFlashStatus("%d Geraet(e) gefunden", nf);
+    Serial.printf("# /flash Discovery: %d Geraet(e)\n", nf);
+    esp_task_wdt_add(NULL);
+    g_flashBusy = false;
+}
+
 // ============================== Gateway-Setup =============================== //
 void runGateway() {
     if (CFG.rs485De >= 0) { pinMode(CFG.rs485De, OUTPUT); busTx(false); }   // Idle = Empfangen (respektiert Invert)
@@ -812,6 +1015,48 @@ void runGateway() {
         if (g_updAvail) g_doInstall = true;
         r->redirect("/update");
     });
+    // --- Bus-Firmware-Update: eine .hex ueber den Bus in ein HBWired-Geraet flashen ---
+    webServer.on("/flash", HTTP_GET, [](AsyncWebServerRequest* r) {
+        if (authFail(r)) return; r->send(200, "text/html", flashHtml()); });
+    webServer.on("/flashdiscover", HTTP_POST, [](AsyncWebServerRequest* r) {
+        if (authFail(r)) return;
+        if (!g_flashBusy) { setFlashStatus("Suche gestartet ..."); g_doDiscover = true; }
+        r->redirect("/flash");
+    });
+    webServer.on("/flash", HTTP_POST,
+        [](AsyncWebServerRequest* r) {                      // nach dem Upload: Ziel pruefen, Flash anstossen
+            if (authFail(r)) return;
+            String sel = pval(r, "devsel"), hx = pval(r, "devhex"); hx.trim();
+            uint32_t tgt = (uint32_t)strtoul((hx.length() ? hx : sel).c_str(), nullptr, 16);
+            String msg;
+            if (g_flashBusy)                           msg = F("Es l&auml;uft bereits ein Vorgang.");
+            else if (!g_flashImage || g_flashLen == 0) msg = F("Keine g&uuml;ltige .hex empfangen (oder zu wenig Speicher).");
+            else if (!tgt || tgt == 0xFFFFFFFF)        msg = F("Ung&uuml;ltige Zieladresse.");
+            if (msg.length()) {
+                if (g_flashImage) { free(g_flashImage); g_flashImage = nullptr; g_flashLen = 0; }
+                r->send(200, "text/html", pageHead("Fehler") + "<h2>Fehler</h2><p>" + msg +
+                        "</p><div class=links><a href=/flash>&larr; zur&uuml;ck</a></div>" + pageFoot());
+                return;
+            }
+            g_flashTarget = tgt;
+            setFlashStatus("Flash gestartet -> %08lX (%lu B)", (unsigned long)tgt, (unsigned long)g_flashLen);
+            g_doBusFlash = true;                            // ZULETZT: Image/Len/Target sind jetzt bereit
+            r->send(200, "text/html", pageHead("Flash gestartet", 2) +
+                    F("<h2>Flash l&auml;uft</h2><p>Der Fortschritt erscheint gleich.</p>"
+                      "<div class=links><a href=/flash>Zur Fortschrittsanzeige &rarr;</a></div>") + pageFoot());
+        },
+        [](AsyncWebServerRequest* r, String fn, size_t idx, uint8_t* data, size_t len, bool fin) {
+            if (!webAuthed(r) || g_flashBusy) return;
+            if (idx == 0) {                                 // Upload-Start: 64-KB-Image im Heap anlegen (0xFF = leer)
+                if (g_flashImage) free(g_flashImage);
+                g_flashImage = (uint8_t*)malloc(0x10000);
+                if (g_flashImage) memset(g_flashImage, 0xFF, 0x10000);
+                ihexReset();
+                Serial.printf("# /flash Upload: %s\n", fn.c_str());
+            }
+            if (g_flashImage && len) ihexFeed(data, len);
+            if (fin && g_ihexPos) { g_ihexLine[g_ihexPos] = 0; ihexParseLine(g_ihexLine, g_ihexPos); g_ihexPos = 0; }  // letzte Zeile ohne \n
+        });
     webServer.begin();
     watchdogBegin();
     Serial.println("# OTA + Status-Web (Port 80) + Watchdog aktiv");
@@ -848,6 +1093,8 @@ void loop() {
     ArduinoOTA.handle();
     if (g_doCheckUpd) { g_doCheckUpd = false; updateCheck(); }   // blockierend, aber nur zwischen CCU-Sitzungen
     if (g_doInstall)  { g_doInstall  = false; updateInstall(); }
+    if (g_doBusFlash) { g_doBusFlash = false; busFlashRun(); }     // Geraet ueber den Bus flashen (blockierend)
+    if (g_doDiscover) { g_doDiscover = false; busDiscoverRun(); }  // Geraetesuche fuers /flash-Dropdown
     WiFiClient cli = lgwServer.accept();   // accept() = ehem. available(); holt auch den in handleClient via hasClient() vorgemerkten Neu-Client
     if (cli) {
         Serial.println("# CCU verbunden");
