@@ -59,6 +59,8 @@ struct GwConfig {
     // --- Bus-Zugriff / Kollisionsvermeidung (CSMA/CA, nur Master-Sendepfad) ---
     bool     useCarrierSense = false;     // vor dem Senden auf freien Bus warten (Carrier-Sense)
     uint16_t busIdleMs   = 5;             // Bus muss so lange (ms) still sein, bevor gesendet wird
+    bool     useRetransmit = false;       // Kommando bei fehlender Antwort wiederholen (Master-Retransmit)
+    uint8_t  sendRetries = 3;             // max. Sendeversuche (1 = kein Retransmit), wie hs485d MAX_SEND_RETRY
     String   webPass;                     // Web-UI-Login (leer = kein Login; Benutzer = admin)
     bool     valid       = false;         // schon konfiguriert?
 };
@@ -91,6 +93,8 @@ inline void load(GwConfig& c) {
     c.ackWaitMs   = p.getUShort("ackwait", 400);
     c.useCarrierSense = p.getBool("cs", false);
     c.busIdleMs   = p.getUShort("busidle", 5);
+    c.useRetransmit = p.getBool("rtx", false);
+    c.sendRetries = p.getUChar("rtxn", 3);
     c.webPass     = p.getString("webpass", "");
     p.end();
 }
@@ -120,6 +124,8 @@ inline void save(const GwConfig& c) {
     p.putUShort("ackwait", c.ackWaitMs);
     p.putBool("cs", c.useCarrierSense);
     p.putUShort("busidle", c.busIdleMs);
+    p.putBool("rtx", c.useRetransmit);
+    p.putUChar("rtxn", c.sendRetries);
     p.putString("webpass", c.webPass);
     p.putBool("valid", true);
     p.end();

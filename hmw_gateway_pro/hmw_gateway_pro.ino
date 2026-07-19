@@ -30,7 +30,7 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.1.7"
+#define FW_VERSION "1.1.9"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
@@ -207,6 +207,9 @@ String formHtml() {
     h += "<label><input type=checkbox name=cs " + String(CFG.useCarrierSense ? "checked" : "") +
          "> Carrier-Sense (CSMA/CA: vor dem Senden auf freien Bus warten)</label>";
     h += "<label>Bus-Idle vor dem Senden (ms, 1&ndash;100)</label><input name=busidle type=number value='" + String(CFG.busIdleMs) + "'>";
+    h += "<label><input type=checkbox name=rtx " + String(CFG.useRetransmit ? "checked" : "") +
+         "> Sende-Wiederholung bei fehlender Antwort (nur f&uuml;r FHEM-Direktbetrieb ohne hs485d!)</label>";
+    h += "<label>Sendeversuche (1&ndash;5 &middot; 1 = keine Wiederholung)</label><input name=rtxn type=number value='" + String(CFG.sendRetries) + "'>";
     h += F("<h2>Verbindungs-&Uuml;berwachung</h2>");
     h += "<label>CCU-Inaktivit&auml;ts-Timeout (s, 20&ndash;600)</label><input name=rxto type=number value='" + String(CFG.rxTimeoutS) + "'>";
     h += "<label><input type=checkbox name=ka " + String(CFG.useKeepAlive ? "checked" : "") + "> TCP-Keepalive (toten Peer aktiv erkennen)</label>";
@@ -240,6 +243,7 @@ String statusHtml() {
     row("RS485-Pins",  "RX " + String(CFG.rs485Rx) + " / TX " + String(CFG.rs485Tx) +
                        (CFG.rs485De >= 0 ? " / DE " + String(CFG.rs485De) : " / Auto-Dir"));
     row("Carrier-Sense", CFG.useCarrierSense ? String(CFG.busIdleMs) + " ms Bus-Idle" : "aus");
+    row("Sende-Wiederholung", CFG.useRetransmit ? String(CFG.sendRetries) + " Versuche" : "aus");
     row("AES",         CFG.useAes ? "an" : "aus");
     row("LGW-Port",    String(CFG.port));
     row("CCU",         ccuConn ? "<span class='badge ok'>verbunden</span>" : "<span class='badge bad'>getrennt</span>");
@@ -318,6 +322,8 @@ void handleSave  (AsyncWebServerRequest* r) {
     CFG.ackWaitMs   = clampU(pval(r,"ackwait").toInt(), 50, 2000);
     CFG.useCarrierSense = r->hasParam("cs", true);
     CFG.busIdleMs   = clampU(pval(r,"busidle").toInt(), 1, 100);
+    CFG.useRetransmit = r->hasParam("rtx", true);
+    CFG.sendRetries = (uint8_t)clampU(pval(r,"rtxn").toInt(), 1, 5);
     CFG.webPass     = pval(r,"webpass");
     cfg::save(CFG);
     r->send(200, "text/html", pageHead("Gespeichert") +
@@ -475,26 +481,46 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
         busWaitIdle();                    // CSMA/CA: erst senden, wenn der Bus frei ist (falls aktiviert)
         busSend(bus, bl);
         if (mode == lgw::MODE_UNICAST_ACK) {
-            uint8_t rb[256]; size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
-            // Diagnose: rohe Empfangsbytes IMMER dumpen (auch wenn kein sauberes Frame),
-            // sonst sind wir blind fuer 0xFE-Booter-Antworten/CRC-Muell/Timeout.
-            if (rn) dbgHex("BUS-RX(resp)", rb, rn);
-            else if (g_debugBus) Serial.printf("# BUS-RX(resp) LEER nach %u ms\n", CFG.ackWaitMs);
-            for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START || rb[i] == hmw::START_SHORT) {
-                hmw::Frame f;
-                bool isShort = (rb[i] == hmw::START_SHORT);
-                bool ok = isShort ? hmw::parseSystemFrame(rb + i, rn - i, &f)
-                                  : hmw::parseFrame(rb + i, rn - i, &f);
-                if (ok) {
-                    if (!isShort && f.hasSender && (f.control & 0x03) != 0x01) busAck(f.sender, f.control);
-                    uint8_t rp[260]; uint8_t rpl = lgw::frameToResponse(f, rp);
-                    sendLan(cli, cr, lan, lgw::lanEncode(idx, rp, rpl, lan));
-                    if (g_debugBus)
-                        Serial.printf("# resp 'r' via %s ctrl=%02X len=%u\n",
-                                      isShort ? "system" : "unicast", f.control, f.dataLen);
+            // Master-Retransmit wie hs485d/HM485_Protocol.pm (MAX_SEND_RETRY=3, Fenster =
+            // CFG.ackWaitMs): kommt keine Antwort/kein ACK, dasselbe Frame erneut senden.
+            // Nur OHNE intelligenten Daemon davor sinnvoll (FHEM-Direktbetrieb) -> default AUS;
+            // an der CCU macht das der hs485d (doppelter Retransmit + die laengere Blockade
+            // waeren schaedlich -- s. post-u-Hinweis unten). tries=1 => exakt bisheriges Verhalten.
+            // Der 1. Sendevorgang ist oben schon erfolgt; ab Versuch 2 wird neu gesendet.
+            uint8_t tries = CFG.useRetransmit ? CFG.sendRetries : 1;
+            bool answered = false;
+            for (uint8_t attempt = 1; attempt <= tries && !answered; attempt++) {
+                if (attempt > 1) {              // Wiederholung: Bus frei machen, Puffer leeren, gleiches Frame neu
+                    if (g_debugBus) Serial.printf("# Retransmit %u/%u -> %08lX\n",
+                                                  attempt, tries, (unsigned long)lastQueryAddr);
+                    busWaitIdle();
+                    while (Serial2.available()) Serial2.read();
+                    busSend(bus, bl);
                 }
-                break;
+                uint8_t rb[256]; size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
+                if (rn) dbgHex("BUS-RX(resp)", rb, rn);
+                else if (g_debugBus) Serial.printf("# BUS-RX(resp) LEER nach %u ms (%u/%u)\n",
+                                                   CFG.ackWaitMs, attempt, tries);
+                for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START || rb[i] == hmw::START_SHORT) {
+                    hmw::Frame f;
+                    bool isShort = (rb[i] == hmw::START_SHORT);
+                    bool ok = isShort ? hmw::parseSystemFrame(rb + i, rn - i, &f)
+                                      : hmw::parseFrame(rb + i, rn - i, &f);
+                    if (ok) {
+                        answered = true;
+                        if (!isShort && f.hasSender && (f.control & 0x03) != 0x01) busAck(f.sender, f.control);
+                        uint8_t rp[260]; uint8_t rpl = lgw::frameToResponse(f, rp);
+                        sendLan(cli, cr, lan, lgw::lanEncode(idx, rp, rpl, lan));
+                        if (g_debugBus)
+                            Serial.printf("# resp 'r' via %s ctrl=%02X len=%u\n",
+                                          isShort ? "system" : "unicast", f.control, f.dataLen);
+                    }
+                    break;
+                }
             }
+            if (!answered && CFG.useRetransmit && g_debugBus)
+                Serial.printf("# %08lX nach %u Versuchen ohne Antwort (NACK)\n",
+                              (unsigned long)lastQueryAddr, tries);
             // KEINE blockierende post-u-Nachlausch-Diagnose mehr! Sie hielt den Gateway-Loop
             // nach jedem 'u' bis zu 2,5 s an (nach dem 2. u = Booter kommt nichts -> volle 2,5 s).
             // Das direkt folgende 'p' (WriteFlash der hs485d) wurde dadurch erst nach 2,5 s
