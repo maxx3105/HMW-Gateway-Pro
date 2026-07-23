@@ -36,6 +36,12 @@ public:
         uint8_t  data[DATA];
     };
 
+    // Optionaler Sink: wird nach dem Ablegen JEDES Eintrags aufgerufen (loopTask, ausserhalb
+    // des Ring-Mutex). Dient dem Recorder (capture_log.h), der die Zeile bei laufender
+    // Aufzeichnung zusaetzlich in seinen RAM-Puffer schreibt -- nullptr = kein Sink (Default).
+    typedef void (*Sink)(const Entry&);
+    void setSink(Sink s) { _sink = s; }
+
     // Muss vor dem ersten add() laufen (aus setup(), Scheduler steht): legt den Mutex an.
     void begin() { if (!_mtx) _mtx = xSemaphoreCreateMutex(); }
 
@@ -55,6 +61,10 @@ public:
         _head = (_head + 1) % RING;
         if (_head == 0) _full = true;
         xSemaphoreGive(_mtx);
+        // Sink NACH dem Freigeben des Mutex aufrufen: der Recorder haelt seinen eigenen
+        // Mutex, verschachtelte Locks werden so vermieden. e bleibt gueltig (einziger
+        // Schreiber ist dieser loopTask, kein paralleles add() ueberschreibt den Slot).
+        if (_sink) _sink(e);
     }
 
     // Empfangenes Frame mit CRC-Fehler: roh (undecodiert) ablegen, damit die Stoerung
@@ -97,4 +107,5 @@ private:
     bool   _full = false;
     volatile uint32_t _rx = 0, _tx = 0, _crcErr = 0, _dropped = 0;
     SemaphoreHandle_t _mtx = nullptr;
+    Sink _sink = nullptr;
 };

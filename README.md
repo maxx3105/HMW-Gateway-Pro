@@ -28,6 +28,11 @@ als wartbares „Gerät" mit Config-Portal, OTA, Status-Webseite und Watchdog.
   Ziel/Quelle, Control, Nutzdaten) statt roher Hexdumps, inkl. Zähler für RX/TX,
   CRC-Fehler und letzte Antwortzeit. Auto-Refresh, Pause und „Leeren" — ein sauberer
   Anlern-Mitschnitt ohne USB, gestörte Frames (CRC-Fehler) werden rot mitgeführt.
+- **Telegramm-Aufzeichnung + Download** (`/capture`) — Start/Stopp eines RAM-Mitschnitts
+  (linear, füllt sich von vorne → der Anfang bleibt erhalten) mit Download als
+  tab-getrennte `.txt` (Excel/Editor-freundlich). Zusätzlich Schnell-Download der letzten
+  Telegramme direkt aus dem Sniffer-Ring — ohne Aufzeichnung, jederzeit. Der Puffer wird
+  erst beim Start angelegt (kein RAM-Verbrauch im Ruhezustand).
 - **Watchdog** (`esp_task_wdt`).
 - **AES abschaltbar** (für FHEM-Klartext-Betrieb).
 - **WLAN oder Ethernet** — per Haken in der Konfiguration; Ethernet (LAN8720, z. B.
@@ -84,7 +89,8 @@ als wartbares „Gerät" mit Config-Portal, OTA, Status-Webseite und Watchdog.
 | `hmw_gateway_pro/config.h` | Persistente Konfiguration im NVS (`Preferences`) |
 | `hmw_gateway_pro/hmw_protocol.h` | Bus-Codec (CRC16 `0x1002`, FC-Escaping, Frame-Bau/-Parsing) — header-only |
 | `hmw_gateway_pro/hmw_lgw.h` | LAN-Schicht (LGW-Frames, Bridge-Übersetzung, AES-128-CFB via mbedTLS) — header-only |
-| `hmw_gateway_pro/frame_tap.h` | Frame-Tap: Ringpuffer decodierter Bus-Telegramme + Zähler (Live-Sniffer, später Aufzeichnung/Statistik) — header-only |
+| `hmw_gateway_pro/frame_tap.h` | Frame-Tap: Ringpuffer decodierter Bus-Telegramme + Zähler (Live-Sniffer), optionaler Sink — header-only |
+| `hmw_gateway_pro/capture_log.h` | Telegramm-Aufzeichnung: linearer RAM-Puffer + Zeilen-Formatierer (Recorder/Download) — header-only |
 
 ## Build
 

@@ -26,18 +26,24 @@
 #include "hmw_protocol.h"
 #include "hmw_lgw.h"
 #include "frame_tap.h"
+#include "capture_log.h"
 #include "log_tee.h"
 
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.3.0"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
 //     .bin-Name folgt dem CI-Muster hmw-gateway-pro-<version>.bin.
 #define GH_OWNER "maxx3105"
 #define GH_REPO  "HMW-Gateway-Pro"
+
+// Aufzeichnung (/capture): Groesse des RAM-Mitschnitt-Puffers. malloc erst bei "Start",
+// im Ruhezustand 0 Byte -> kein Dauerverbrauch. ~32 KB fassen mehrere hundert decodierte
+// Telegramme -- genug fuer einen kompletten Anlern-Mitschnitt.
+#define REC_CAPACITY (32u * 1024u)
 
 // Web-Ring-Log: 1 = aktiv (jedes Serial.print* wird zusaetzlich in einen 8-KB-RAM-Ring
 // gespiegelt, abrufbar unter /log -- Anlernmitschnitt ohne USB), 0 = aus (nur UART0).
@@ -109,6 +115,7 @@ volatile uint32_t busLastRxMs = 0;       // millis() des letzten Bus-Bytes (Carr
 // --- Frame-Tap: decodierte Bus-Telegramme fuer den Live-Sniffer (/sniffer) + Zaehler.
 //     Geschrieben aus dem Gateway-Loop (Tap-Aufrufe unten), gelesen vom Async-Web-Task.
 FrameTap        Tap;
+CaptureLog      Capture;                 // RAM-Mitschnitt (Start/Stopp/Download), gespeist vom Tap-Sink
 volatile uint32_t g_lastRespMs = 0;      // Round-Trip der letzten Unicast-Antwort (ms), fuer Timing-Analyse
 
 // --- Auto-Update-Status (Web-UI liest; loop schreibt). char[] statt String, weil
@@ -266,7 +273,7 @@ String statusHtml() {
     row("Uptime",      ut);
     row("Freier Heap", String(ESP.getFreeHeap()) + " B");
     row("Firmware",    F("v" FW_VERSION " &middot; " __DATE__ " " __TIME__));
-    h += F("</table><div class=links><a href=/config>Konfiguration &auml;ndern</a> &middot; <a href=/sniffer>Sniffer</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/update>Firmware-Update</a></div>");
+    h += F("</table><div class=links><a href=/config>Konfiguration &auml;ndern</a> &middot; <a href=/sniffer>Sniffer</a> &middot; <a href=/capture>Aufzeichnung</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/update>Firmware-Update</a></div>");
     h += pageFoot();
     return h;
 }
@@ -384,7 +391,7 @@ String sniffHtml(bool paused) {
     h += F("</table><div class=links>");
     h += paused ? F("<a href=/sniffer>&#8635; Live (3 s)</a>") : F("<a href='/sniffer?pause'>&#10073;&#10073; Pause</a>");
     h += F(" &middot; <a href=/sniffer>Aktualisieren</a> &middot; <a href='/sniffer?clear'>Leeren</a>"
-           " &middot; <a href=/log>System-Log</a> &middot; <a href=/>&larr; Status</a></div>");
+           " &middot; <a href=/capture>Aufzeichnung</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/>&larr; Status</a></div>");
 
     // Eintraege unter dem Mutex herauskopieren, danach lockfrei formatieren (wie beim LogTee).
     FrameTap::Entry* buf = (FrameTap::Entry*)malloc(sizeof(FrameTap::Entry) * FrameTap::RING);
@@ -420,6 +427,77 @@ void handleSniffer(AsyncWebServerRequest* r) {
     if (authFail(r)) return;
     if (r->hasParam("clear")) { Tap.clear(); r->redirect("/sniffer"); return; }
     r->send(200, "text/html", sniffHtml(r->hasParam("pause")));
+}
+
+// ---- Aufzeichnung (/capture): RAM-Mitschnitt mit Download ------------------------- //
+// Tap-Sink: laeuft im loopTask, haengt jede Telegramm-Zeile an den Recorder an (nur
+// wenn aktiv -- sonst sofortiger Rueckkehr, kein Overhead). RAM-Append (Mikrosekunden),
+// daher timing-unkritisch; der Sniffer-Ring bleibt davon unberuehrt.
+void captureSink(const FrameTap::Entry& e) {
+    if (!Capture.recording()) return;
+    char line[220];
+    size_t n = captureEntryLine(e, line, sizeof(line));
+    Capture.append(line, n);
+}
+// Kopfzeilen fuer die Download-Datei (Version + Spaltenkopf, tab-getrennt).
+String captureHeader() {
+    return String(F("# HMW-Gateway-Pro Telegramm-Mitschnitt  fw " FW_VERSION "\n"
+                    "# t(s)\ttyp\tziel\tquelle\tctrl\tlen\tdaten(hex)  (~ = gekuerzt)\n"));
+}
+String captureHtml(bool memErr) {
+    bool rec = Capture.recording();
+    String h = pageHead("HMW-LGW Aufzeichnung", rec ? 3 : 0);   // waehrend der Aufnahme Groesse mitlaufen lassen
+    h += F("<h2>Aufzeichnung</h2>");
+    if (memErr) h += F("<p><span class='badge bad'>zu wenig RAM</span> &ndash; Puffer konnte nicht angelegt werden.</p>");
+    h += F("<table><tr><td>Status</td><td>");
+    if (rec)                     h += F("<span class='badge ok'>l&auml;uft</span>");
+    else if (Capture.full())     h += F("<span class='badge bad'>Puffer voll &ndash; gestoppt</span>");
+    else if (Capture.hasData())  h += F("gestoppt");
+    else                         h += F("aus");
+    h += F("</td></tr>");
+    if (Capture.cap()) {
+        char b[48]; snprintf(b, sizeof(b), "%u / %u Bytes", (unsigned)Capture.len(), (unsigned)Capture.cap());
+        h += "<tr><td>Puffer</td><td>" + String(b) + "</td></tr>";
+    }
+    h += F("</table><div class=links>");
+    if (!rec) h += F("<form method=POST action=/capture/start style='display:inline'><button type=submit>Aufzeichnung starten</button></form>");
+    else      h += F("<form method=POST action=/capture/stop style='display:inline'><button type=submit>Stoppen</button></form>");
+    if (Capture.hasData())
+        h += F(" &middot; <a href=/capture/download>&#8681; Download (.txt)</a> &middot; "
+               "<form method=POST action=/capture/discard style='display:inline'>"
+               "<button type=submit style='background:var(--bad);margin-top:0'>Verwerfen</button></form>");
+    h += F("</div>");
+    h += "<h2>Schnell-Download</h2><p>Die letzten " + String((unsigned)FrameTap::RING) +
+         " Telegramme direkt aus dem Sniffer-Ring &ndash; ohne Aufzeichnung, jederzeit.</p>";
+    h += F("<div class=links><a href=/capture.txt>&#8681; Letzte Telegramme (.txt)</a></div>"
+           "<div class=links><a href=/sniffer>&larr; Sniffer</a> &middot; <a href=/>Status</a></div>");
+    h += pageFoot();
+    return h;
+}
+void handleCapture(AsyncWebServerRequest* r) {
+    if (authFail(r)) return;
+    r->send(200, "text/html", captureHtml(r->hasParam("err")));
+}
+// Download eines Textmitschnitts als Datei-Anhang. txtBody wird vom Aufrufer gebaut.
+static void sendTxtAttachment(AsyncWebServerRequest* r, const String& body, const char* fname) {
+    AsyncWebServerResponse* resp = r->beginResponse(200, "text/plain; charset=utf-8", body);
+    String cd = "attachment; filename=\"" + String(fname) + "\"";
+    resp->addHeader("Content-Disposition", cd.c_str());
+    r->send(resp);
+}
+void handleCaptureDownload(AsyncWebServerRequest* r) {   // aufgezeichneter Puffer
+    if (authFail(r)) return;
+    sendTxtAttachment(r, captureHeader() + Capture.snapshot(), "hmw-capture.txt");
+}
+void handleCaptureTxt(AsyncWebServerRequest* r) {        // Schnell-Dump des Sniffer-Rings
+    if (authFail(r)) return;
+    String body = captureHeader();
+    FrameTap::Entry* buf = (FrameTap::Entry*)malloc(sizeof(FrameTap::Entry) * FrameTap::RING);
+    size_t n = buf ? Tap.copyOut(buf, FrameTap::RING) : 0;
+    char line[220];
+    for (size_t i = 0; i < n; i++) { captureEntryLine(buf[i], line, sizeof(line)); body += line; }
+    free(buf);
+    sendTxtAttachment(r, body, "hmw-ring.txt");
 }
 
 // System-Log-Seite: zeigt den RAM-Ring (Serial-Mirror). Fuer den Anlernmitschnitt:
@@ -884,6 +962,19 @@ void runGateway() {
     webServer.on("/save", HTTP_POST, handleSave);
     webServer.on("/log", HTTP_GET, handleLog);
     webServer.on("/sniffer", HTTP_GET, handleSniffer);
+    webServer.on("/capture", HTTP_GET, handleCapture);
+    webServer.on("/capture.txt", HTTP_GET, handleCaptureTxt);
+    webServer.on("/capture/download", HTTP_GET, handleCaptureDownload);
+    webServer.on("/capture/start", HTTP_POST, [](AsyncWebServerRequest* r) {
+        if (authFail(r)) return;
+        r->redirect(Capture.start(REC_CAPACITY) ? "/capture" : "/capture?err=mem");
+    });
+    webServer.on("/capture/stop", HTTP_POST, [](AsyncWebServerRequest* r) {
+        if (authFail(r)) return; Capture.stop(); r->redirect("/capture");
+    });
+    webServer.on("/capture/discard", HTTP_POST, [](AsyncWebServerRequest* r) {
+        if (authFail(r)) return; Capture.discard(); r->redirect("/capture");
+    });
     webServer.on("/update", HTTP_GET, [](AsyncWebServerRequest* r) {
         if (authFail(r)) return; r->send(200, "text/html", updateHtml()); });
     webServer.on("/update", HTTP_POST,
@@ -930,6 +1021,8 @@ void setup() {
     bootMs = millis();
     Serial.printf("# HMW-LGW Firmware v%s (Build %s %s)\n", FW_VERSION, __DATE__, __TIME__);
     Tap.begin();
+    Capture.begin();
+    Tap.setSink(captureSink);   // jeder Tap-Eintrag geht zusaetzlich in den Recorder (nur wenn aktiv)
     cfg::load(CFG);
     Serial.printf("# Config: valid=%d ssid=%s serial=%s port=%u aes=%d eth=%d bus=RX%d/TX%d/DE%d\n",
                   CFG.valid, CFG.ssid.c_str(), CFG.serial.c_str(), CFG.port, CFG.useAes,
