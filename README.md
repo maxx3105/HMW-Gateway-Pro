@@ -24,6 +24,10 @@ als wartbares „Gerät" mit Config-Portal, OTA, Status-Webseite und Watchdog.
 - **OTA** — ArduinoOTA *und* Web-OTA (`/update`), Flashen ohne USB.
 - **Status-Webseite** (`/`) — RSSI, IP, CCU-Status, gefundene Geräte, letztes Bus-Event,
   Uptime, freier Heap; Auto-Refresh.
+- **Live-Sniffer** (`/sniffer`) — decodierte Bus-Telegramme in Echtzeit (Richtung,
+  Ziel/Quelle, Control, Nutzdaten) statt roher Hexdumps, inkl. Zähler für RX/TX,
+  CRC-Fehler und letzte Antwortzeit. Auto-Refresh, Pause und „Leeren" — ein sauberer
+  Anlern-Mitschnitt ohne USB, gestörte Frames (CRC-Fehler) werden rot mitgeführt.
 - **Watchdog** (`esp_task_wdt`).
 - **AES abschaltbar** (für FHEM-Klartext-Betrieb).
 - **WLAN oder Ethernet** — per Haken in der Konfiguration; Ethernet (LAN8720, z. B.
@@ -80,6 +84,7 @@ als wartbares „Gerät" mit Config-Portal, OTA, Status-Webseite und Watchdog.
 | `hmw_gateway_pro/config.h` | Persistente Konfiguration im NVS (`Preferences`) |
 | `hmw_gateway_pro/hmw_protocol.h` | Bus-Codec (CRC16 `0x1002`, FC-Escaping, Frame-Bau/-Parsing) — header-only |
 | `hmw_gateway_pro/hmw_lgw.h` | LAN-Schicht (LGW-Frames, Bridge-Übersetzung, AES-128-CFB via mbedTLS) — header-only |
+| `hmw_gateway_pro/frame_tap.h` | Frame-Tap: Ringpuffer decodierter Bus-Telegramme + Zähler (Live-Sniffer, später Aufzeichnung/Statistik) — header-only |
 
 ## Build
 

@@ -82,7 +82,12 @@ struct Frame {
 };
 
 // Parst ein rohes (escaped) Segment ab 0xFD + prueft CRC. true bei Erfolg.
-inline bool parseFrame(const uint8_t* raw, size_t rawLen, Frame* f) {
+// crcErr (optional): wird auf true gesetzt, wenn der Frame strukturell vollstaendig
+// ist, aber die CRC nicht stimmt -- so laesst sich eine echte Bus-Stoerung von einem
+// bloss noch unvollstaendigen (gesplitteten) Frame unterscheiden. Bei unvollstaendigem
+// Frame bleibt crcErr false (kein Fehler, nur noch nicht genug Bytes).
+inline bool parseFrame(const uint8_t* raw, size_t rawLen, Frame* f, bool* crcErr = nullptr) {
+    if (crcErr) *crcErr = false;
     uint8_t full[300];
     full[0] = START;
     size_t fl = 1 + unescape(raw + 1, rawLen - 1, full + 1);
@@ -94,8 +99,10 @@ inline bool parseFrame(const uint8_t* raw, size_t rawLen, Frame* f) {
     uint8_t ln = full[lenIdx];
     size_t crcPos = hs ? (size_t)(9 + ln) : (size_t)(5 + ln);
     if (crcPos + 2 > fl) return false;
-    if (crc16(full, crcPos) != (uint16_t)(((uint16_t)full[crcPos] << 8) | full[crcPos + 1]))
+    if (crc16(full, crcPos) != (uint16_t)(((uint16_t)full[crcPos] << 8) | full[crcPos + 1])) {
+        if (crcErr) *crcErr = true;               // vollstaendig, aber CRC falsch -> echte Stoerung
         return false;
+    }
     f->target  = ((uint32_t)full[1] << 24) | ((uint32_t)full[2] << 16) | ((uint32_t)full[3] << 8) | full[4];
     f->control = control;
     f->hasSender = hs;
@@ -113,7 +120,8 @@ inline bool parseFrame(const uint8_t* raw, size_t rawLen, Frame* f) {
 
 // Parst ein 0xFE-system/short-Frame (Booter-Antworten): FE destAddr(1B) control len payload... crc16.
 // Fuellt f mit control+payload (target = 1-Byte-Zieladresse, ohne sender). true bei gueltiger CRC.
-inline bool parseSystemFrame(const uint8_t* raw, size_t rawLen, Frame* f) {
+inline bool parseSystemFrame(const uint8_t* raw, size_t rawLen, Frame* f, bool* crcErr = nullptr) {
+    if (crcErr) *crcErr = false;
     uint8_t full[300];
     full[0] = START_SHORT;
     size_t fl = 1 + unescape(raw + 1, rawLen - 1, full + 1);
@@ -122,8 +130,10 @@ inline bool parseSystemFrame(const uint8_t* raw, size_t rawLen, Frame* f) {
     if (ln < 2) return false;
     size_t crcPos = (size_t)ln + 2;                    // FE(1)+dest(1)+ctrl(1)+len(1)+payload(ln-2)
     if (crcPos + 2 > fl) return false;
-    if (crc16(full, crcPos) != (uint16_t)(((uint16_t)full[crcPos] << 8) | full[crcPos + 1]))
+    if (crc16(full, crcPos) != (uint16_t)(((uint16_t)full[crcPos] << 8) | full[crcPos + 1])) {
+        if (crcErr) *crcErr = true;
         return false;
+    }
     f->target    = full[1];
     f->control   = full[2];
     f->hasSender = false;
