@@ -32,7 +32,7 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.4.0"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
@@ -116,7 +116,30 @@ volatile uint32_t busLastRxMs = 0;       // millis() des letzten Bus-Bytes (Carr
 //     Geschrieben aus dem Gateway-Loop (Tap-Aufrufe unten), gelesen vom Async-Web-Task.
 FrameTap        Tap;
 CaptureLog      Capture;                 // RAM-Mitschnitt (Start/Stopp/Download), gespeist vom Tap-Sink
-volatile uint32_t g_lastRespMs = 0;      // Round-Trip der letzten Unicast-Antwort (ms), fuer Timing-Analyse
+
+// --- Bus-Statistik (/stats): Unicast-Zuverlaessigkeit + Antwortzeiten. Geschrieben aus
+//     dem Gateway-Loop (handleLan), gelesen vom Async-Web-Task. Einzelne volatile-Felder
+//     -> atomare 32-bit-Zugriffe, ein Schreiber. respMinMs startet auf "leer" (0xFFFFFFFF).
+struct BusStats {
+    volatile uint32_t queries     = 0;   // Unicast-ACK-Abfragen gesamt
+    volatile uint32_t answered    = 0;   // davon beantwortet
+    volatile uint32_t noAnswer    = 0;   // davon ohne Antwort (Timeout / NACK)
+    volatile uint32_t retransmits = 0;   // zusaetzliche Sendeversuche (attempt > 1)
+    volatile uint32_t respLastMs  = 0;   // letzte Antwortzeit
+    volatile uint32_t respMinMs   = 0xFFFFFFFF;
+    volatile uint32_t respMaxMs   = 0;
+    volatile uint32_t respSumMs   = 0;   // Summe -> Durchschnitt = respSumMs / answered
+    void onAnswer(uint32_t ms) {
+        respLastMs = ms; answered++; respSumMs += ms;
+        if (ms > respMaxMs) respMaxMs = ms;
+        if (ms < respMinMs) respMinMs = ms;
+    }
+    void reset() {
+        queries = 0; answered = 0; noAnswer = 0; retransmits = 0;
+        respLastMs = 0; respMaxMs = 0; respSumMs = 0; respMinMs = 0xFFFFFFFF;
+    }
+};
+BusStats        g_stats;
 
 // --- Auto-Update-Status (Web-UI liest; loop schreibt). char[] statt String, weil
 //     cross-task gelesen -> kein Realloc (konsistent mit lastEvent). ---
@@ -273,7 +296,7 @@ String statusHtml() {
     row("Uptime",      ut);
     row("Freier Heap", String(ESP.getFreeHeap()) + " B");
     row("Firmware",    F("v" FW_VERSION " &middot; " __DATE__ " " __TIME__));
-    h += F("</table><div class=links><a href=/config>Konfiguration &auml;ndern</a> &middot; <a href=/sniffer>Sniffer</a> &middot; <a href=/capture>Aufzeichnung</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/update>Firmware-Update</a></div>");
+    h += F("</table><div class=links><a href=/config>Konfiguration &auml;ndern</a> &middot; <a href=/sniffer>Sniffer</a> &middot; <a href=/capture>Aufzeichnung</a> &middot; <a href=/stats>Statistik</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/update>Firmware-Update</a></div>");
     h += pageFoot();
     return h;
 }
@@ -387,11 +410,11 @@ String sniffHtml(bool paused) {
     h += F("</td></tr>");
     if (Tap.dropped()) h += "<tr><td>Verworfen (Last)</td><td>" + String(Tap.dropped()) + "</td></tr>";
     h += "<tr><td>Letzte Antwortzeit</td><td>" +
-         (g_lastRespMs ? String((uint32_t)g_lastRespMs) + " ms" : String("&mdash;")) + "</td></tr>";
+         (g_stats.answered ? String((uint32_t)g_stats.respLastMs) + " ms" : String("&mdash;")) + "</td></tr>";
     h += F("</table><div class=links>");
     h += paused ? F("<a href=/sniffer>&#8635; Live (3 s)</a>") : F("<a href='/sniffer?pause'>&#10073;&#10073; Pause</a>");
     h += F(" &middot; <a href=/sniffer>Aktualisieren</a> &middot; <a href='/sniffer?clear'>Leeren</a>"
-           " &middot; <a href=/capture>Aufzeichnung</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/>&larr; Status</a></div>");
+           " &middot; <a href=/capture>Aufzeichnung</a> &middot; <a href=/stats>Statistik</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/>&larr; Status</a></div>");
 
     // Eintraege unter dem Mutex herauskopieren, danach lockfrei formatieren (wie beim LogTee).
     FrameTap::Entry* buf = (FrameTap::Entry*)malloc(sizeof(FrameTap::Entry) * FrameTap::RING);
@@ -470,7 +493,7 @@ String captureHtml(bool memErr) {
     h += "<h2>Schnell-Download</h2><p>Die letzten " + String((unsigned)FrameTap::RING) +
          " Telegramme direkt aus dem Sniffer-Ring &ndash; ohne Aufzeichnung, jederzeit.</p>";
     h += F("<div class=links><a href=/capture.txt>&#8681; Letzte Telegramme (.txt)</a></div>"
-           "<div class=links><a href=/sniffer>&larr; Sniffer</a> &middot; <a href=/>Status</a></div>");
+           "<div class=links><a href=/sniffer>&larr; Sniffer</a> &middot; <a href=/stats>Statistik</a> &middot; <a href=/>Status</a></div>");
     h += pageFoot();
     return h;
 }
@@ -498,6 +521,56 @@ void handleCaptureTxt(AsyncWebServerRequest* r) {        // Schnell-Dump des Sni
     for (size_t i = 0; i < n; i++) { captureEntryLine(buf[i], line, sizeof(line)); body += line; }
     free(buf);
     sendTxtAttachment(r, body, "hmw-ring.txt");
+}
+
+// ---- Statistik / Timing-Analyse (/stats) ----------------------------------------- //
+// Aufsatz auf die Frame-Tap-Zaehler (pro Art) + die Unicast-Statistik (g_stats):
+// Telegramm-Aufkommen, CRC-Fehlerrate, Antwort-Erfolgsquote und Antwortzeiten.
+String statsHtml() {
+    String h = pageHead("HMW-LGW Statistik", 5);   // 5 s Auto-Refresh
+    uint32_t up = (millis() - bootMs) / 1000; if (!up) up = 1;
+    uint32_t total = Tap.rx() + Tap.tx();
+    auto row = [&](const String& k, const String& v) { h += "<tr><td>" + k + "</td><td>" + v + "</td></tr>"; };
+    char b[40];
+
+    h += F("<h2>Telegramme</h2><table>");
+    row(F("SEND &rarr; Bus"),  String(Tap.kindCount(FrameTap::SEND)));
+    row(F("ACK &rarr; Bus"),   String(Tap.kindCount(FrameTap::ACK)));
+    row(F("EVENT &larr; Bus"), String(Tap.kindCount(FrameTap::EVENT)));
+    row(F("RESP &larr; Bus"),  String(Tap.kindCount(FrameTap::RESP)));
+    row(F("Gesamt RX / TX"),   String(Tap.rx()) + " / " + String(Tap.tx()));
+    snprintf(b, sizeof(b), "%lu /min", (unsigned long)((uint64_t)total * 60 / up));
+    row(F("&Oslash; Rate"),    b);
+    h += F("</table><h2>Fehler &amp; Zuverl&auml;ssigkeit</h2><table>");
+    { String v = String(Tap.crcErr());
+      uint32_t denom = Tap.rx() + Tap.crcErr();
+      if (denom) { snprintf(b, sizeof(b), " (%lu&permil;)", (unsigned long)((uint64_t)Tap.crcErr() * 1000 / denom)); v += b; }
+      if (Tap.crcErr()) v += F(" <span class='badge bad'>Bus pr&uuml;fen</span>");
+      row(F("CRC-Fehler"), v); }
+    row(F("Unicast-Abfragen"), String(g_stats.queries));
+    { String v = String(g_stats.answered);
+      if (g_stats.queries) { snprintf(b, sizeof(b), " (%lu%%)", (unsigned long)((uint64_t)g_stats.answered * 100 / g_stats.queries)); v += b; }
+      row(F("davon beantwortet"), v); }
+    { String v = String(g_stats.noAnswer);
+      if (g_stats.noAnswer) v += F(" <span class='badge bad'>?</span>");
+      row(F("ohne Antwort"), v); }
+    row(F("Retransmits"), String(g_stats.retransmits));
+    if (Tap.dropped()) row(F("Sniffer-Drops"), String(Tap.dropped()));
+    h += F("</table><h2>Antwortzeit (Unicast)</h2><table>");
+    if (g_stats.answered) {
+        row(F("letzte"),    String((uint32_t)g_stats.respLastMs) + " ms");
+        row(F("min / max"), String((uint32_t)g_stats.respMinMs) + " / " + String((uint32_t)g_stats.respMaxMs) + " ms");
+        row(F("&Oslash;"),  String((uint32_t)(g_stats.respSumMs / g_stats.answered)) + " ms");
+    } else row(F("Antwortzeit"), String("&mdash; (noch keine)"));
+    h += F("</table><div class=links><a href='/stats?reset'>Z&auml;hler zur&uuml;cksetzen</a> &middot; "
+           "<a href=/sniffer>Sniffer</a> &middot; <a href=/capture>Aufzeichnung</a> &middot; <a href=/>&larr; Status</a></div>");
+    h += pageFoot();
+    return h;
+}
+void handleStats(AsyncWebServerRequest* r) {
+    if (authFail(r)) return;
+    if (r->hasParam("reset")) { Tap.resetCounters(); g_stats.reset(); r->redirect("/stats"); return; }
+    r->send(200, "text/html", statsHtml());
 }
 
 // System-Log-Seite: zeigt den RAM-Ring (Serial-Mirror). Fuer den Anlernmitschnitt:
@@ -664,6 +737,7 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
             // Der 1. Sendevorgang ist oben schon erfolgt; ab Versuch 2 wird neu gesendet.
             uint8_t tries = CFG.useRetransmit ? CFG.sendRetries : 1;
             bool answered = false;
+            g_stats.queries++;
             for (uint8_t attempt = 1; attempt <= tries && !answered; attempt++) {
                 if (attempt > 1) {              // Wiederholung: Bus frei machen, Puffer leeren, gleiches Frame neu
                     if (g_debugBus) Serial.printf("# Retransmit %u/%u -> %08lX\n",
@@ -672,6 +746,7 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
                     while (Serial2.available()) Serial2.read();
                     busSend(bus, bl);
                     txAt = millis();
+                    g_stats.retransmits++;
                 }
                 uint8_t rb[256]; size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
                 if (rn) dbgHex("BUS-RX(resp)", rb, rn);
@@ -685,7 +760,7 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
                                       : hmw::parseFrame(rb + i, rn - i, &f, &crcErr);
                     if (ok) {
                         answered = true;
-                        g_lastRespMs = millis() - txAt;   // Round-Trip fuer die Timing-Analyse
+                        g_stats.onAnswer(millis() - txAt);   // Round-Trip fuer die Timing-Analyse
                         Tap.add(FrameTap::RESP, f.target, f.control, f.hasSender, f.sender,
                                 f.data, f.dataLen, true);
                         if (!isShort && f.hasSender && (f.control & 0x03) != 0x01) busAck(f.sender, f.control);
@@ -699,6 +774,7 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
                     break;
                 }
             }
+            if (!answered) g_stats.noAnswer++;
             if (!answered && CFG.useRetransmit && g_debugBus)
                 Serial.printf("# %08lX nach %u Versuchen ohne Antwort (NACK)\n",
                               (unsigned long)lastQueryAddr, tries);
@@ -975,6 +1051,7 @@ void runGateway() {
     webServer.on("/capture/discard", HTTP_POST, [](AsyncWebServerRequest* r) {
         if (authFail(r)) return; Capture.discard(); r->redirect("/capture");
     });
+    webServer.on("/stats", HTTP_GET, handleStats);
     webServer.on("/update", HTTP_GET, [](AsyncWebServerRequest* r) {
         if (authFail(r)) return; r->send(200, "text/html", updateHtml()); });
     webServer.on("/update", HTTP_POST,

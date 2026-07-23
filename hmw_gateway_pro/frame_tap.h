@@ -48,9 +48,8 @@ public:
     // Ein decodiertes Frame ablegen. data/dataLen duerfen leer sein (z.B. ACK).
     void add(uint8_t kind, uint32_t target, uint8_t control, bool hasSender,
              uint32_t sender, const uint8_t* data, uint8_t dataLen, bool crcOk) {
-        if (kind == EVENT || kind == RESP)      _rx++;      // Zaehler lockfrei fuehren --
-        else if (kind == SEND || kind == ACK)   _tx++;      // unabhaengig davon, ob der
-        if (kind == BADCRC || !crcOk)           _crcErr++;  // Ring-Eintrag gespeichert wird.
+        if (kind < 5) _kind[kind]++;   // pro Art zaehlen (SEND/EVENT/RESP/ACK/BADCRC) --
+                                       // lockfrei, unabhaengig davon ob der Ring-Eintrag passt.
         if (!_mtx) return;
         if (xSemaphoreTake(_mtx, pdMS_TO_TICKS(10)) != pdTRUE) { _dropped++; return; }
         Entry& e = _buf[_head];
@@ -87,25 +86,32 @@ public:
         return n;
     }
 
+    // Nur die Zaehler zuruecksetzen, den Ring unangetastet lassen (fuer /stats).
+    void resetCounters() {
+        for (int i = 0; i < 5; i++) _kind[i] = 0;
+        _dropped = 0;
+    }
     // Ring UND Zaehler zuruecksetzen -- fuer einen frischen Mitschnitt (z.B. vor dem Anlernen).
     void clear() {
         if (_mtx && xSemaphoreTake(_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
             _head = 0; _full = false;
             xSemaphoreGive(_mtx);
         }
-        _rx = _tx = _crcErr = _dropped = 0;
+        resetCounters();
     }
 
-    uint32_t rx()      const { return _rx; }
-    uint32_t tx()      const { return _tx; }
-    uint32_t crcErr()  const { return _crcErr; }
+    uint32_t kindCount(uint8_t k) const { return k < 5 ? _kind[k] : 0; }
+    uint32_t rx()      const { return _kind[EVENT] + _kind[RESP]; }   // vom Bus empfangen
+    uint32_t tx()      const { return _kind[SEND]  + _kind[ACK];  }   // auf den Bus gesendet
+    uint32_t crcErr()  const { return _kind[BADCRC]; }
     uint32_t dropped() const { return _dropped; }
 
 private:
     Entry  _buf[RING];
     size_t _head = 0;
     bool   _full = false;
-    volatile uint32_t _rx = 0, _tx = 0, _crcErr = 0, _dropped = 0;
+    volatile uint32_t _kind[5] = {0, 0, 0, 0, 0};   // Zaehler je Kind (Index = Kind-Wert)
+    volatile uint32_t _dropped = 0;                 // im Ring verworfen (Mutex-Contention)
     SemaphoreHandle_t _mtx = nullptr;
     Sink _sink = nullptr;
 };
