@@ -30,7 +30,7 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.2.1"
+#define FW_VERSION "1.2.2"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
@@ -985,13 +985,18 @@ static uint8_t busQuery(uint32_t target, uint8_t cmd, uint8_t* out, uint8_t outm
         size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
         for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START) {
             hmw::Frame f;
-            if (hmw::parseFrame(rb + i, rn - i, &f) && f.hasSender && f.sender == target) {
+            // Haertung: nur die an die Zentrale gerichtete Antwort nehmen (f.target==CENTRAL).
+            // Ein spontaner Announce (frisch geflashtes/rebootetes Geraet) hat zwar sender==target,
+            // ist aber an BROADCAST adressiert -> wuerde sonst als h/v/n-Antwort missdeutet (die
+            // ersten 2 Announce-Bytes 0x41 0x00 ergaeben "Typ 0x41"). KEIN break: liegt so ein
+            // Announce vor der echten Antwort im selben Puffer, wird diese danach noch gefunden.
+            if (hmw::parseFrame(rb + i, rn - i, &f) && f.hasSender
+                && f.sender == target && f.target == hmw::CENTRAL) {
                 uint8_t l = (f.dataLen > outmax) ? outmax : f.dataLen;
                 memcpy(out, f.data, l);
                 if ((f.control & 0x03) != 0x01) busAck(f.sender, f.control);   // Geraet quittieren
                 return l;
             }
-            break;
         }
     }
     return 0;
