@@ -22,6 +22,9 @@ als wartbares „Gerät" mit Config-Portal, OTA, Status-Webseite und Watchdog.
 - **NVS-Konfiguration + Captive-Portal** — keine Secrets im Code; SSID/Passwort/Serial/
   AES-Schlüssel/feste IP/Port werden über ein Webformular gesetzt und im Flash gespeichert.
 - **OTA** — ArduinoOTA *und* Web-OTA (`/update`), Flashen ohne USB.
+- **Geräte-Firmware über den Bus flashen** (`/flash`) — eine App-`.hex` per Browser-Upload
+  in ein HBWired-Gerät mit HBW-Booter flashen, **ohne CCU/`fwmap`**; mit Geräte-Discovery
+  (Typ/FW/Serial), byte-genauem Verify und Fortschrittsanzeige.
 - **Status-Webseite** (`/`) — RSSI, IP, CCU-Status, gefundene Geräte, letztes Bus-Event,
   Uptime, freier Heap; Auto-Refresh.
 - **Live-Sniffer** (`/sniffer`) — decodierte Bus-Telegramme in Echtzeit (Richtung,
@@ -44,6 +47,22 @@ als wartbares „Gerät" mit Config-Portal, OTA, Status-Webseite und Watchdog.
 - **RS485-Pins zur Laufzeit konfigurierbar** (RX/TX/DE über `/config`, kein Reflash).
 - **Verbindungs-Überwachung zur Laufzeit tunebar** — Inaktivitäts-Timeout, optionales
   TCP-Keepalive, Unicast-Antwort-Fenster (alle über `/config`, kein Reflash nötig).
+
+## Geräte-Firmware über den Bus flashen (`/flash`)
+
+Neben dem CCU-Weg (Update-Dialog + `fwmap`) kann das Gateway ein HBWired-Gerät mit
+[HBW-Booter](https://github.com/maxx3105/HBW-Booter) **selbst über den Bus flashen** —
+unabhängig von der CCU:
+
+1. `/flash` öffnen, **„Geräte am Bus suchen"** — das Dropdown listet die gefundenen Geräte mit
+   **Typ (Klarname), Firmware-Version und Serial** (oder Busadresse manuell eingeben).
+2. App-`.hex` hochladen — die Firmware muss **unter der Boot-Section** liegen.
+3. Das Gateway fährt als Master die Booter-Choreografie
+   `z z → u → p → w`-Schleife `→ p → r`-Verify `→ g` und zeigt den Fortschritt.
+
+Während des Vorgangs pausiert die CCU-Verbindung (wie beim Auto-Update). Der Booter schützt
+sich selbst (Boot-Section, CRC-Gate): ein Abbruch lässt das Gerät im Booter, nicht defekt.
+Ideal für Entwicklung und für Setups **ganz ohne CCU**.
 
 ## Hardware
 
