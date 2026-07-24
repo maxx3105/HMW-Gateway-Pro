@@ -80,9 +80,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           # Bei manuellem Lauf (workflow_dispatch mit release_tag) legt action-gh-release den
-          # Tag serverseitig an GITHUB_SHA an -> kein git-push des Tags noetig. Bei Tag-Push
-          # ist tag_name der gepushte Tag.
+          # Tag serverseitig an -- und zwar am AKTUELLEN Workflow-Commit (target_commitish =
+          # github.sha). Ohne das nimmt GitHub als target_commitish den Default-Branch (main),
+          # der Tag zeigt dann auf den falschen Commit. Bei Tag-Push existiert der Tag schon,
+          # target_commitish wird ignoriert -> unschaedlich.
           tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: ${{ steps.bin.outputs.name }}
           # Semver-Konvention: Tags MIT Bindestrich (z.B. v1.3.0-pre.1, v1.4.0-rc.1) sind
           # Vorabversionen -> als GitHub-Pre-Release markieren; plain-Tags (v1.3.0) = volles Release.
