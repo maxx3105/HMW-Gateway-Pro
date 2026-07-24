@@ -75,6 +75,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.bin.outputs.name }}
+          # Semver-Konvention: Tags MIT Bindestrich (z.B. v1.3.0-pre.1, v1.4.0-rc.1) sind
+          # Vorabversionen -> als GitHub-Pre-Release markieren; plain-Tags (v1.3.0) = volles Release.
+          # Pre-Releases erscheinen NICHT unter releases/latest -> das Firmware-Auto-Update zieht sie nicht.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             Firmware **${{ steps.ver.outputs.version }}** (Tag `${{ github.ref_name }}`)
 
