@@ -23,8 +23,8 @@ als wartbares „Gerät" mit Config-Portal, OTA, Status-Webseite und Watchdog.
   AES-Schlüssel/feste IP/Port werden über ein Webformular gesetzt und im Flash gespeichert.
 - **OTA** — ArduinoOTA *und* Web-OTA (`/update`), Flashen ohne USB.
 - **Geräte-Firmware über den Bus flashen** (`/flash`) — eine App-`.hex` per Browser-Upload
-  in ein HBWired-Gerät mit HBW-Booter flashen, **ohne CCU/`fwmap`**; mit Geräte-Discovery,
-  byte-genauem Verify und Fortschrittsanzeige.
+  in ein HBWired-Gerät mit HBW-Booter flashen, **ohne CCU/`fwmap`**; mit Geräte-Discovery
+  (Typ/FW/Serial), byte-genauem Verify und Fortschrittsanzeige.
 - **Status-Webseite** (`/`) — RSSI, IP, CCU-Status, gefundene Geräte, letztes Bus-Event,
   Uptime, freier Heap; Auto-Refresh.
 - **Watchdog** (`esp_task_wdt`).
@@ -41,7 +41,8 @@ Neben dem CCU-Weg (Update-Dialog + `fwmap`) kann das Gateway ein HBWired-Gerät 
 [HBW-Booter](https://github.com/maxx3105/HBW-Booter) **selbst über den Bus flashen** —
 unabhängig von der CCU:
 
-1. `/flash` öffnen, **„Geräte am Bus suchen"** (oder Busadresse manuell eingeben).
+1. `/flash` öffnen, **„Geräte am Bus suchen"** — das Dropdown listet die gefundenen Geräte mit
+   **Typ (Klarname), Firmware-Version und Serial** (oder Busadresse manuell eingeben).
 2. App-`.hex` hochladen — die Firmware muss **unter der Boot-Section** liegen.
 3. Das Gateway fährt als Master die Booter-Choreografie
    `z z → u → p → w`-Schleife `→ p → r`-Verify `→ g` und zeigt den Fortschritt.

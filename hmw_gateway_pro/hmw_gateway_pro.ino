@@ -30,7 +30,7 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.2.1"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
@@ -134,6 +134,21 @@ static void setFlashStatus(const char* fmt, ...) {
 static uint32_t g_ihexExt = 0;           // aktuelle Extended-Linear/Segment-Basis
 static char     g_ihexLine[600];         // Puffer fuer eine ':'-Zeile
 static uint16_t g_ihexPos = 0;
+
+// Geraete-Info aus der /flash-Discovery (Interrogation h/v/n je Adresse), parallel zu devAddr[].
+struct DevInfo { uint8_t type; uint8_t hw; uint16_t fw; char serial[11]; bool valid; };
+DevInfo g_devInfo[32];
+// Klarname zu einem HMW/HBW-Geraetetyp (deviceType-Byte); unbekannt -> nullptr (Web zeigt "Typ 0xXX").
+// Bekannte Typen aus den eigenen Projekten -- hier bei Bedarf erweitern.
+static const char* deviceTypeName(uint8_t t) {
+    switch (t) {
+        case 0x10: return "IO-4-FM";
+        case 0x19: return "Sen-SC-12-DR";
+        case 0x1A: return "Sen-SC-12-FM";
+        case 0x1B: return "IO-12-FM";
+        default:   return nullptr;
+    }
+}
 
 // ============================== Helfer ====================================== //
 static String ipStr(uint32_t v) { return IPAddress(v).toString(); }
@@ -389,7 +404,20 @@ String flashHtml() {
            "<form method=POST action=/flash enctype='multipart/form-data'>"
            "<label>Ziel aus gefundenen Ger&auml;ten</label><select name=devsel>"
            "<option value=''>-- manuell --</option>");
-    for (int i = 0; i < devCount && i < 32; i++) { char b[10]; snprintf(b, sizeof(b), "%08X", devAddr[i]); h += "<option>" + String(b) + "</option>"; }
+    for (int i = 0; i < devCount && i < 32; i++) {
+        char a[10]; snprintf(a, sizeof(a), "%08X", devAddr[i]);
+        String label = a;
+        DevInfo& d = g_devInfo[i];
+        if (d.valid) {
+            const char* tn = deviceTypeName(d.type);
+            char x[24];
+            if (tn) { label += " - "; label += tn; }
+            else    { snprintf(x, sizeof(x), " - Typ 0x%02X", d.type); label += x; }
+            snprintf(x, sizeof(x), " - FW %u.%02u", d.fw >> 8, d.fw & 0xFF); label += x;
+            if (d.serial[0]) { label += " - "; label += d.serial; }
+        }
+        h += "<option value='" + String(a) + "'>" + esc(label) + "</option>";
+    }
     h += F("</select>"
            "<label>oder Busadresse manuell (8 Hex, z.&thinsp;B. 42FFFFFF)</label><input name=devhex placeholder='42FFFFFF'>"
            "<label>Firmware (.hex, App unter der Boot-Section)</label><input type=file name=fw accept='.hex'>"
@@ -944,17 +972,50 @@ void busFlashRun() {
     g_flashBusy = false;
 }
 
-// Geraetesuche fuers /flash-Dropdown (Binaersuche wie CMD_DISCOVERY, fuellt devAddr[]).
+// Fragt ein Geraet im NORMALBETRIEB per Kommando (h/v/n) ab und liest dessen Antwort-Payload
+// (Info-Frame, KEIN ACK -- daher nicht busTxAck). Rueckgabe = Payload-Laenge (0 = keine Antwort).
+// Quittiert die Antwort per busAck, damit das Geraet sie nicht 3x retransmittiert.
+static uint8_t busQuery(uint32_t target, uint8_t cmd, uint8_t* out, uint8_t outmax) {
+    uint8_t frame[32];
+    size_t n = hmw::buildFrame(target, 0x18, hmw::CENTRAL, &cmd, 1, frame, true);
+    for (uint8_t t = 0; t < 3; t++) {
+        while (Serial2.available()) Serial2.read();
+        busSend(frame, n);
+        uint8_t rb[128];
+        size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
+        for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START) {
+            hmw::Frame f;
+            if (hmw::parseFrame(rb + i, rn - i, &f) && f.hasSender && f.sender == target) {
+                uint8_t l = (f.dataLen > outmax) ? outmax : f.dataLen;
+                memcpy(out, f.data, l);
+                if ((f.control & 0x03) != 0x01) busAck(f.sender, f.control);   // Geraet quittieren
+                return l;
+            }
+            break;
+        }
+    }
+    return 0;
+}
+
+// Geraetesuche fuers /flash-Dropdown: Adress-Binaersuche + Interrogation (Typ/HW/FW/Serial via h/v/n).
 void busDiscoverRun() {
     g_flashBusy = true;
     esp_task_wdt_delete(NULL);
     setFlashStatus("Suche Geraete am Bus ...");
     uint32_t found[32]; int nf = 0;
     busDiscover(0, 0, found, &nf);
-    for (int i = 0; i < nf && i < 32; i++) devAddr[i] = found[i];
+    for (int i = 0; i < nf && i < 32; i++) {
+        devAddr[i] = found[i];
+        DevInfo& d = g_devInfo[i]; memset(&d, 0, sizeof(d));
+        uint8_t b[16];
+        setFlashStatus("Interrogation %d/%d ...", i + 1, nf);
+        if (busQuery(found[i], 'h', b, sizeof(b)) >= 2) { d.type = b[0]; d.hw = b[1]; d.valid = true; }  // h: [Typ, HW-Ver]
+        if (busQuery(found[i], 'v', b, sizeof(b)) >= 2) { d.fw = ((uint16_t)b[0] << 8) | b[1]; }         // v: [FW-Hi, FW-Lo]
+        if (busQuery(found[i], 'n', b, sizeof(b)) >= 10) { memcpy(d.serial, b, 10); d.serial[10] = 0; }  // n: 10x Serial
+    }
     devCount = nf;
     setFlashStatus("%d Geraet(e) gefunden", nf);
-    Serial.printf("# /flash Discovery: %d Geraet(e)\n", nf);
+    Serial.printf("# /flash Discovery: %d Geraet(e) (mit Interrogation)\n", nf);
     esp_task_wdt_add(NULL);
     g_flashBusy = false;
 }
