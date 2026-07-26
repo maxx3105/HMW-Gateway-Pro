@@ -56,7 +56,7 @@ Ideal für Entwicklung und für Setups **ganz ohne CCU**.
 - **3,3 V RS485-Transceiver** — Auto-Direction-Modul (z. B. XY-K485) oder MAX3485 / SN65HVD72.
   ⚠️ ESP32 ist **nicht 5 V-tolerant**.
 - Bus: **19200 8E1** (even parity — macht die Firmware automatisch), 2-Draht RS485,
-  120 Ω-Terminierung an den Enden, gemeinsame Masse.
+  gemeinsame Masse.
 
 ### Variante A: ESP32 DevKit (WLAN)
 
