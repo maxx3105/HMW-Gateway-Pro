@@ -306,6 +306,11 @@ String formHtml() {
     h += "<label>FW-Version (dez oder 0x&hellip;)</label><input name=selffw value='" + String(CFG.selfFw) +
          "'><small>aktuell 0x" + String(CFG.selfFw, HEX) + "</small>";
     h += "<label>Seriennummer (genau 10 Zeichen)</label><input name=selfser maxlength=10 value='" + esc(CFG.selfSerial) + "'>";
+    h += "<label>Bus-Betriebsart (noch ohne Wirkung &ndash; kommt mit Dual-Bus)</label><select name=busmode>";
+    { const char* bm[3] = { "ein Bus (SINGLE)", "Ring (RING)", "zwei getrennte Str&auml;nge (SPLIT)" };
+      for (uint8_t i = 0; i < 3; i++)
+          h += "<option value=" + String(i) + (CFG.busMode == i ? " selected" : "") + ">" + bm[i] + "</option>"; }
+    h += F("</select>");
     h += F("<h2>Web-Login</h2>");
     h += "<label>Passwort (leer = kein Login &middot; Benutzer = <b>admin</b>)</label><input name=webpass type=password value='" + esc(CFG.webPass) + "'>";
     h += F("<button type=submit>Speichern &amp; Neustart</button></form>"
@@ -427,6 +432,7 @@ void handleSave  (AsyncWebServerRequest* r) {
       s = pval(r,"selfhw");   if (s.length()) CFG.selfHw   = (uint8_t)strtoul(s.c_str(), nullptr, 0);
       s = pval(r,"selffw");   if (s.length()) CFG.selfFw   = (uint16_t)strtoul(s.c_str(), nullptr, 0);
       s = pval(r,"selfser");  if (s.length()) CFG.selfSerial = s;
+      s = pval(r,"busmode");  if (s.length()) { uint8_t m = (uint8_t)s.toInt(); if (m <= 2) CFG.busMode = m; }
     }
     cfg::save(CFG);
     r->send(200, "text/html", pageHead("Gespeichert") +
@@ -811,9 +817,61 @@ void busDiscover(uint32_t prefix, int fixed, uint32_t* found, int* nf) {
 }
 
 #if SELF_DEVICE_ENABLE
+// ---- Emulierte Geraete-EEPROM des Selbst-Geraets --------------------------------------- //
+// Die CCU liest/schreibt die Geraetekonfiguration ueber die Bus-Kommandos R/W und uebernimmt
+// sie mit C. Wir spiegeln dafuer die relevanten CFG-Felder in einen Puffer; das Layout MUSS
+// exakt zu den <address index="..."> der hs485types-XML passen.
+// Multi-Byte-Werte big-endian (so schreibt die CCU Listenwerte).
+//
+//   0x0001  Bus-Betriebsart (0=SINGLE 1=RING 2=SPLIT)
+//   0x0002  CENTRAL_ADDRESS (4 B, von der CCU gesetzt)
+//   0x0006  DIRECT_LINK_DEACTIVATE (Bit 0)
+//   0x0007  Carrier-Sense an/aus
+//   0x0008  Bus-Idle vor dem Senden (ms)
+//   0x0009  Master-Retransmit an/aus
+//   0x000A  max. Sendeversuche
+//   0x000B  Unicast-Antwort-Wartezeit (2 B, ms)
+//   0x000D  CCU-Inaktivitaets-Timeout (2 B, s)
+static uint8_t selfEeprom[1024];
+
+static void encodeSelfEeprom() {          // CFG -> EEPROM-Abbild (Boot und nach Web-Aenderung)
+    memset(selfEeprom, 0, sizeof(selfEeprom));
+    selfEeprom[0x0001] = CFG.busMode;
+    selfEeprom[0x0005] = 0x01;                                   // CENTRAL_ADDRESS = 1
+    selfEeprom[0x0006] = 0x01;                                   // DIRECT_LINK_DEACTIVATE
+    selfEeprom[0x0007] = CFG.useCarrierSense ? 1 : 0;
+    selfEeprom[0x0008] = (uint8_t)(CFG.busIdleMs > 255 ? 255 : CFG.busIdleMs);
+    selfEeprom[0x0009] = CFG.useRetransmit ? 1 : 0;
+    selfEeprom[0x000A] = CFG.sendRetries;
+    selfEeprom[0x000B] = (uint8_t)(CFG.ackWaitMs >> 8);
+    selfEeprom[0x000C] = (uint8_t)CFG.ackWaitMs;
+    selfEeprom[0x000D] = (uint8_t)(CFG.rxTimeoutS >> 8);
+    selfEeprom[0x000E] = (uint8_t)CFG.rxTimeoutS;
+}
+
+// EEPROM-Abbild -> CFG (Kommando 'C' = "Konfiguration uebernehmen"). Werte werden geklemmt,
+// damit ein Schreibfehler der CCU das Gateway nicht unbrauchbar macht.
+static void applySelfEeprom() {
+    uint8_t  mode  = selfEeprom[0x0001];
+    uint16_t ackMs = ((uint16_t)selfEeprom[0x000B] << 8) | selfEeprom[0x000C];
+    uint16_t rxTo  = ((uint16_t)selfEeprom[0x000D] << 8) | selfEeprom[0x000E];
+    CFG.busMode         = (mode <= 2) ? mode : 0;
+    CFG.useCarrierSense = selfEeprom[0x0007] != 0;
+    CFG.busIdleMs       = selfEeprom[0x0008] ? selfEeprom[0x0008] : 5;
+    CFG.useRetransmit   = selfEeprom[0x0009] != 0;
+    CFG.sendRetries     = selfEeprom[0x000A] ? selfEeprom[0x000A] : 3;
+    if (ackMs >= 50  && ackMs <= 2000) CFG.ackWaitMs  = ackMs;
+    if (rxTo  >= 10  && rxTo  <= 3600) CFG.rxTimeoutS = rxTo;
+    cfg::save(CFG);
+    encodeSelfEeprom();                   // Klemmungen zurueckspiegeln
+    Serial.printf("# SELF: Konfiguration uebernommen (busMode=%u cs=%u/%ums rtx=%u/%u ack=%ums rxto=%us)\n",
+                  CFG.busMode, CFG.useCarrierSense, CFG.busIdleMs,
+                  CFG.useRetransmit, CFG.sendRetries, CFG.ackWaitMs, CFG.rxTimeoutS);
+}
+
 // Beantwortet ein an die eigene Bus-Adresse gerichtetes CMD_SEND INTERN (nie auf dem Bus).
-// Minimal-Test: h/v/n fuer Discovery+Interrogation; R (Config lesen) mit Nullen; sonst leere
-// Antwort. Antwort-Control wie ein echtes Geraet: 0x18 | (Seq der Anfrage << 5), sonst
+// h/v/n fuer Discovery+Interrogation, R/W/C fuer die Geraetekonfiguration.
+// Antwort-Control wie ein echtes Geraet: 0x18 | (Seq der Anfrage << 5), sonst
 // verwirft die CCU die Sequenznummer (vgl. HBWired.cpp sendFrameSingle).
 void handleSelfSend(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* emb, uint8_t elen) {
     uint8_t bus[300]; size_t bl = lgw::embeddedToBus(emb, elen, bus);
@@ -827,9 +885,22 @@ void handleSelfSend(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t
         case 'v': ans[0] = (uint8_t)(CFG.selfFw >> 8); ans[1] = (uint8_t)CFG.selfFw; al = 2; break;
         case 'n': { String s = CFG.selfSerial; while (s.length() < 10) s += ' ';           // Seriennummer, auf 10 Zeichen
                     memcpy(ans, s.c_str(), 10); al = 10; } break;
-        case 'R': { uint8_t len = (f.dataLen >= 4) ? f.data[3] : 0;                        // Read EEPROM -> Nullen
+        case 'R': {                                                                        // Read EEPROM: [R adrHi adrLo len]
+                    if (f.dataLen < 4) break;
+                    uint16_t adr = ((uint16_t)f.data[1] << 8) | f.data[2];
+                    uint8_t  len = f.data[3];
                     if (len > sizeof(ans)) len = sizeof(ans);
-                    memset(ans, 0, len); al = len; } break;
+                    if ((uint32_t)adr + len > sizeof(selfEeprom)) len = 0;                 // ausserhalb -> leer
+                    memcpy(ans, selfEeprom + adr, len); al = len; } break;
+        case 'W': {                                                                        // Write EEPROM: [W adrHi adrLo len daten...]
+                    if (f.dataLen < 4) break;
+                    uint16_t adr = ((uint16_t)f.data[1] << 8) | f.data[2];
+                    uint8_t  n   = f.data[3];
+                    if ((uint16_t)n + 4 > f.dataLen) n = f.dataLen - 4;                     // nur wirklich vorhandene Bytes
+                    for (uint8_t i = 0; i < n; i++)
+                        if ((uint32_t)adr + i < sizeof(selfEeprom)) selfEeprom[adr + i] = f.data[4 + i];
+                    if (g_debugBus) Serial.printf("# SELF W @0x%04X %u Byte\n", adr, n); } break;
+        case 'C': applySelfEeprom(); break;                                                // Konfiguration uebernehmen
         default:  al = 0; break;                                                            // generische leere Antwort
     }
     uint8_t respCtrl = 0x18 | (uint8_t)(((f.control >> 1) & 0x03) << 5);
@@ -1368,6 +1439,9 @@ void busDiscoverRun() {
 
 // ============================== Gateway-Setup =============================== //
 void runGateway() {
+#if SELF_DEVICE_ENABLE
+    encodeSelfEeprom();          // EEPROM-Abbild aus der Config aufbauen, bevor die CCU liest
+#endif
     if (CFG.rs485De >= 0) { pinMode(CFG.rs485De, OUTPUT); busTx(false); }   // Idle = Empfangen (respektiert Invert)
     Serial2.begin(BUS_BAUD, SERIAL_8E1, CFG.rs485Rx, CFG.rs485Tx);   // HMW-Bus = 8E1 (even parity)! Strenge HW-UARTs (z.B. ATmega32A) verwerfen sonst jeden Frame
     lgw::lanKey(CFG.passphrase.c_str(), aesKey);

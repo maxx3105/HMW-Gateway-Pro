@@ -1,43 +1,78 @@
 <?xml version="1.0" encoding="ISO-8859-1"?>
 <!--
-  hmw_lgw_dual.xml  MINIMAL-TESTVERSION v3.
-  Impersonations-Diagnose bewiesen: CCU typisiert per Interrogation (Typ 0x1B -> HMW-IO-12-FM
-  matcht, volle R/W-Config-Abfrage). Unser Typ 0x70 wurde NICHT gematcht -> XML-Problem.
-  v3 = Struktur so nah wie moeglich an der funktionierenden hmw_io_12_fm.xml:
-    - Typ DEZIMAL (112 = 0x70), HW = 1 (Firmware meldet 0x01).
-    - Standard-dev_master (CENTRAL_ADDRESS + enforce, DIRECT_LINK_DEACTIVATE + enforce, BUS_MODE).
-    - Wartungskanal (channel 0) wie jedes echte eq3-hmw-Geraet.
-  Frueher fehlten die Kanaele -> ggf. als unvollstaendig verworfen. Volle Version: hmw_lgw_dual_full.xml.
-  0x70 = HBW-LC-Sw8-DR (auf Test-CCU ohne sw8 unkritisch; vor Produktion freies Byte).
+  hmw_lgw_dual.xml : Geraetebeschreibung fuer das HMW-Gateway-Pro-Dual.
+  Das Gateway meldet sich zusaetzlich als HMW-Busgeraet an und wird dadurch in der CCU
+  konfigurierbar (Vorbild HmIPW-DRAP: Betriebsart als Geraeteparameter).
+
+  WICHTIG - Typ-Byte: Eine CCU OHNE jp-hb-devices-addon typisiert ein FREI ERFUNDENES Typ-Byte
+  nicht (weder hs485types-XML noch /firmware/fwmap reichen) -> Geraet bleibt "HMW-Generic".
+  Erprobter Weg: den Slot eines vorhandenen, ungenutzten eq3-Typs uebernehmen. Hier: 22 (0x16)
+  = HMW-IO-SR-FM. Dazu diese Datei als /firmware/hs485types/hmw_io_sr_fm.xml ablegen
+  (Original vorher sichern!) und im Gateway unter /config den Geraetetyp auf 22 stellen.
+  const_value ist DEZIMAL (eq3-Konvention), Datei mit LF-Zeilenenden und ISO-8859-1 ohne BOM.
+
+  Das EEPROM-Layout unten MUSS exakt zu encodeSelfEeprom()/applySelfEeprom() im Sketch passen.
 -->
 <device eep_size="1024" version="01">
 
   <supported_types>
     <type id="HMW-LGW-Dual" name="RS485 Homebrew LAN Gateway Dual-Bus" priority="2">
-      <parameter const_value="112" index="0" size="1"/>   <!-- 112 = 0x70, deviceType ('h') -->
-      <parameter const_value="1"   index="1" size="1"/>    <!-- HW-Version ('h') -->
+      <parameter const_value="22" index="0" size="1"/>   <!-- deviceType ('h'); 22 = 0x16 -->
+      <parameter const_value="1"  index="1" size="1"/>   <!-- HW-Version ('h') -->
     </type>
   </supported_types>
 
   <paramset id="hmw_lgw_dual_dev_master" type="MASTER">
+
+    <!-- Bus-Betriebsart: das Gegenstueck zum DRAP-Dropdown "Buskonfiguration".
+         Wird gespeichert und angewendet; wirksam wird RING/SPLIT mit dem Dual-Bus-Umbau. -->
+    <parameter id="BUS_MODE">
+      <logical type="option">
+        <option id="SINGLE" default="true"/>
+        <option id="RING"/>
+        <option id="SPLIT"/>
+      </logical>
+      <physical interface="eeprom" size="1.0" type="integer"><address index="0x0001"/></physical>
+    </parameter>
+
     <parameter id="CENTRAL_ADDRESS" hidden="true">
       <logical type="integer"/>
       <physical interface="eeprom" size="4" type="integer"><address index="0x0002"/></physical>
     </parameter>
     <enforce id="CENTRAL_ADDRESS" value="1"/>
+
     <parameter id="DIRECT_LINK_DEACTIVATE" hidden="true">
       <logical default="false" type="boolean"/>
       <physical interface="eeprom" size="0.1" type="integer"><address index="0x0006"/></physical>
     </parameter>
     <enforce id="DIRECT_LINK_DEACTIVATE" value="true"/>
-    <parameter id="BUS_MODE">
-      <logical type="option">
-        <option id="SINGLE"/>
-        <option id="RING" default="true"/>
-        <option id="SPLIT"/>
-      </logical>
-      <physical size="1.0" type="integer" interface="eeprom"><address index="0x0007"/></physical>
+
+    <!-- Ab hier: echte Betriebsparameter des Gateways, aus der CCU aenderbar. -->
+    <parameter id="CARRIER_SENSE">
+      <logical default="false" type="boolean"/>
+      <physical interface="eeprom" size="1.0" type="integer"><address index="0x0007"/></physical>
     </parameter>
+    <parameter id="BUS_IDLE_TIME">
+      <logical type="integer" unit="ms" default="5" min="1" max="255"/>
+      <physical interface="eeprom" size="1.0" type="integer"><address index="0x0008"/></physical>
+    </parameter>
+    <parameter id="RETRANSMIT">
+      <logical default="false" type="boolean"/>
+      <physical interface="eeprom" size="1.0" type="integer"><address index="0x0009"/></physical>
+    </parameter>
+    <parameter id="SEND_RETRIES">
+      <logical type="integer" default="3" min="1" max="10"/>
+      <physical interface="eeprom" size="1.0" type="integer"><address index="0x000A"/></physical>
+    </parameter>
+    <parameter id="ACK_WAIT_TIME">
+      <logical type="integer" unit="ms" default="400" min="50" max="2000"/>
+      <physical interface="eeprom" size="2.0" type="integer"><address index="0x000B"/></physical>
+    </parameter>
+    <parameter id="RX_TIMEOUT">
+      <logical type="integer" unit="s" default="60" min="10" max="3600"/>
+      <physical interface="eeprom" size="2.0" type="integer"><address index="0x000D"/></physical>
+    </parameter>
+
   </paramset>
 
   <channels>

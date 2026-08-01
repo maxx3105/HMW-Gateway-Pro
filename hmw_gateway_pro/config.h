@@ -71,6 +71,9 @@ struct GwConfig {
     uint8_t  selfHw      = 0x01;          // HW-Version (Antwort auf 'h')
     uint16_t selfFw      = 0x0102;        // FW-Version (Antwort auf 'v')
     String   selfSerial  = "LGW0000001";  // Seriennummer (Antwort auf 'n'), GENAU 10 Zeichen
+    // Bus-Betriebsart: 0=SINGLE (ein Bus), 1=RING, 2=SPLIT. Wird schon gespeichert und ist in
+    // der CCU einstellbar; WIRKSAM erst mit dem Dual-Bus-Umbau (siehe DUAL-BUS-KONZEPT.md).
+    uint8_t  busMode     = 0;
     bool     valid       = false;         // schon konfiguriert?
 };
 
@@ -111,6 +114,7 @@ inline void load(GwConfig& c) {
     c.selfHw      = p.getUChar("selfhw", 0x01);
     c.selfFw      = p.getUShort("selffw", 0x0102);
     c.selfSerial  = p.getString("selfser", "LGW0000001");
+    c.busMode     = p.getUChar("busmode", 0);
     p.end();
 }
 
@@ -148,6 +152,7 @@ inline void save(const GwConfig& c) {
     p.putUChar("selfhw", c.selfHw);
     p.putUShort("selffw", c.selfFw);
     p.putString("selfser", c.selfSerial);
+    p.putUChar("busmode", c.busMode);
     p.putBool("valid", true);
     p.end();
 }
