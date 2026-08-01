@@ -32,7 +32,7 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.3.0-selftest"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
@@ -69,6 +69,13 @@ const uint32_t BUS_BAUD   = 19200;
 const uint32_t PROBE_WINDOW_MS = 12;
 const uint32_t WDT_TIMEOUT_S   = 30;
 const uint32_t BUS_CS_MAX_WAIT_MS = 100;   // Carrier-Sense: max. Wartezeit auf freien Bus (Notausstieg)
+
+// --- SELBST-GERAET: Gateway meldet sich zusaetzlich als HMW-Busgeraet an eigener Adresse an,
+//     damit es in der CCU als konfigurierbares Geraet erscheint (Konzept §11). Es beantwortet
+//     Discovery + h/v/n/R INTERN (nie auf dem Bus).
+//     ALLE Werte (Adresse/Typ/HW/FW/Serial) stehen in der NVS-Config und sind ueber /config
+//     aenderbar -> Ausprobieren von Typ-/XML-Kombinationen OHNE Reflash.
+#define SELF_DEVICE_ENABLE   1
 
 // --- Ethernet-PHY (nur bei CFG.useEth aktiv). Werte = ESP32-ETH01 / WT32-ETH01
 //     (LAN8720 an RMII). Andere LAN8720-Boards hier anpassen, z.B. Olimex
@@ -287,6 +294,18 @@ String formHtml() {
     h += "<label>Keepalive Intervall (s)</label><input name=kaintvl type=number value='" + String(CFG.kaIntvlS) + "'>";
     h += "<label>Keepalive Count</label><input name=kacnt type=number value='" + String(CFG.kaCount) + "'>";
     h += "<label>Unicast-Antwort-Wartezeit (ms, 50&ndash;2000)</label><input name=ackwait type=number value='" + String(CFG.ackWaitMs) + "'>";
+    // --- Selbst-Geraet: als HMW-Geraet in der CCU erscheinen (Typ/Serial ohne Reflash aenderbar) ---
+    h += F("<h2>Selbst-Ger&auml;t (in der CCU)</h2>");
+    h += "<label><input type=checkbox name=selfen " + String(CFG.selfEnable ? "checked" : "") +
+         "> als HMW-Ger&auml;t in der CCU anmelden</label>";
+    h += "<label>Busadresse (dez oder 0x&hellip;)</label><input name=selfaddr value='" + String(CFG.selfAddr) +
+         "'><small>aktuell 0x" + String(CFG.selfAddr, HEX) + "</small>";
+    h += "<label>Ger&auml;tetyp (dez oder 0x&hellip;) &middot; muss zur XML passen</label><input name=selftype value='" +
+         String(CFG.selfType) + "'><small>aktuell 0x" + String(CFG.selfType, HEX) + " = " + String(CFG.selfType) + " dez</small>";
+    h += "<label>HW-Version</label><input name=selfhw type=number value='" + String(CFG.selfHw) + "'>";
+    h += "<label>FW-Version (dez oder 0x&hellip;)</label><input name=selffw value='" + String(CFG.selfFw) +
+         "'><small>aktuell 0x" + String(CFG.selfFw, HEX) + "</small>";
+    h += "<label>Seriennummer (genau 10 Zeichen)</label><input name=selfser maxlength=10 value='" + esc(CFG.selfSerial) + "'>";
     h += F("<h2>Web-Login</h2>");
     h += "<label>Passwort (leer = kein Login &middot; Benutzer = <b>admin</b>)</label><input name=webpass type=password value='" + esc(CFG.webPass) + "'>";
     h += F("<button type=submit>Speichern &amp; Neustart</button></form>"
@@ -312,6 +331,11 @@ String statusHtml() {
         row("WLAN",    esc(WiFi.SSID()) + " (" + String(WiFi.RSSI()) + " dBm)");
     row("RS485-Pins",  "RX " + String(CFG.rs485Rx) + " / TX " + String(CFG.rs485Tx) +
                        (CFG.rs485De >= 0 ? " / DE " + String(CFG.rs485De) : " / Auto-Dir"));
+    row("Selbst-Ger&auml;t", CFG.selfEnable
+            ? esc(CFG.selfSerial) + " &middot; Adr 0x" + String(CFG.selfAddr, HEX) +
+              " &middot; Typ " + String(CFG.selfType) + " (0x" + String(CFG.selfType, HEX) + ")" +
+              " &middot; HW " + String(CFG.selfHw) + " &middot; FW 0x" + String(CFG.selfFw, HEX)
+            : String("aus"));
     row("Carrier-Sense", CFG.useCarrierSense ? String(CFG.busIdleMs) + " ms Bus-Idle" : "aus");
     row("Sende-Wiederholung", CFG.useRetransmit ? String(CFG.sendRetries) + " Versuche" : "aus");
     row("AES",         CFG.useAes ? "an" : "aus");
@@ -395,6 +419,15 @@ void handleSave  (AsyncWebServerRequest* r) {
     CFG.useRetransmit = r->hasParam("rtx", true);
     CFG.sendRetries = (uint8_t)clampU(pval(r,"rtxn").toInt(), 1, 5);
     CFG.webPass     = pval(r,"webpass");
+    // Selbst-Geraet: Zahlen mit strtoul(base 0) -> "22" (dez) und "0x16" (hex) beide erlaubt
+    CFG.selfEnable  = r->hasParam("selfen", true);
+    { String s;
+      s = pval(r,"selfaddr"); if (s.length()) CFG.selfAddr = (uint32_t)strtoul(s.c_str(), nullptr, 0);
+      s = pval(r,"selftype"); if (s.length()) CFG.selfType = (uint8_t)strtoul(s.c_str(), nullptr, 0);
+      s = pval(r,"selfhw");   if (s.length()) CFG.selfHw   = (uint8_t)strtoul(s.c_str(), nullptr, 0);
+      s = pval(r,"selffw");   if (s.length()) CFG.selfFw   = (uint16_t)strtoul(s.c_str(), nullptr, 0);
+      s = pval(r,"selfser");  if (s.length()) CFG.selfSerial = s;
+    }
     cfg::save(CFG);
     r->send(200, "text/html", pageHead("Gespeichert") +
             F("<meta http-equiv=refresh content='7;url=/'>"
@@ -777,6 +810,39 @@ void busDiscover(uint32_t prefix, int fixed, uint32_t* found, int* nf) {
     }
 }
 
+#if SELF_DEVICE_ENABLE
+// Beantwortet ein an die eigene Bus-Adresse gerichtetes CMD_SEND INTERN (nie auf dem Bus).
+// Minimal-Test: h/v/n fuer Discovery+Interrogation; R (Config lesen) mit Nullen; sonst leere
+// Antwort. Antwort-Control wie ein echtes Geraet: 0x18 | (Seq der Anfrage << 5), sonst
+// verwirft die CCU die Sequenznummer (vgl. HBWired.cpp sendFrameSingle).
+void handleSelfSend(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* emb, uint8_t elen) {
+    uint8_t bus[300]; size_t bl = lgw::embeddedToBus(emb, elen, bus);
+    hmw::Frame f;
+    if (!hmw::parseFrame(bus, bl, &f) || f.dataLen == 0) return;
+    uint8_t cmd = f.data[0];
+
+    uint8_t ans[64]; uint8_t al = 0;
+    switch (cmd) {
+        case 'h': ans[0] = CFG.selfType; ans[1] = CFG.selfHw; al = 2; break;               // Typ + HW-Version
+        case 'v': ans[0] = (uint8_t)(CFG.selfFw >> 8); ans[1] = (uint8_t)CFG.selfFw; al = 2; break;
+        case 'n': { String s = CFG.selfSerial; while (s.length() < 10) s += ' ';           // Seriennummer, auf 10 Zeichen
+                    memcpy(ans, s.c_str(), 10); al = 10; } break;
+        case 'R': { uint8_t len = (f.dataLen >= 4) ? f.data[3] : 0;                        // Read EEPROM -> Nullen
+                    if (len > sizeof(ans)) len = sizeof(ans);
+                    memset(ans, 0, len); al = len; } break;
+        default:  al = 0; break;                                                            // generische leere Antwort
+    }
+    uint8_t respCtrl = 0x18 | (uint8_t)(((f.control >> 1) & 0x03) << 5);
+    uint8_t rp[80]; uint8_t rpl = 0;
+    rp[rpl++] = lgw::CMD_RESPONSE;
+    rp[rpl++] = respCtrl;
+    memcpy(rp + rpl, ans, al); rpl += al;
+    uint8_t lan[320];
+    sendLan(cli, cr, lan, lgw::lanEncode(idx, rp, rpl, lan));
+    if (g_debugBus) Serial.printf("# SELF '%c'(%02X) -> %u Byte\n", (cmd >= 32 && cmd < 127) ? cmd : '.', cmd, al);
+}
+#endif
+
 // ============================== Bridge ====================================== //
 void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl, uint8_t plen, uint32_t& lgwIdx) {
     if (plen == 0) return;
@@ -792,6 +858,12 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
         uint8_t mode = pl[1];
         lastQueryAddr = ((uint32_t)pl[2]<<24)|((uint32_t)pl[3]<<16)|((uint32_t)pl[4]<<8)|pl[5];
         lastQueryMs   = millis();
+#if SELF_DEVICE_ENABLE
+        if (CFG.selfEnable && lastQueryAddr == CFG.selfAddr) {   // an das Gateway selbst -> intern, nicht auf den Bus
+            handleSelfSend(cli, cr, idx, pl + 2, plen - 2);
+            return;
+        }
+#endif
         uint8_t bus[300]; size_t bl = lgw::embeddedToBus(pl + 2, plen - 2, bus);
         dbgHex("BUS-TX(send)", bus, bl);
         busWaitIdle();                    // CSMA/CA: erst senden, wenn der Bus frei ist (falls aktiviert)
@@ -873,6 +945,15 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
                              (uint8_t)(found[i]>>8),(uint8_t)found[i] };
             sendLan(cli, cr, lan, lgw::lanEncode((uint8_t)(++lgwIdx), p, 5, lan));
         }
+#if SELF_DEVICE_ENABLE
+        if (CFG.selfEnable) {   // Selbst-Geraet zusaetzlich als gefunden melden (Rest via handleSelfSend)
+            uint32_t a = CFG.selfAddr;
+            uint8_t p[5] = { lgw::CMD_DEVFOUND, (uint8_t)(a>>24),(uint8_t)(a>>16),(uint8_t)(a>>8),(uint8_t)a };
+            sendLan(cli, cr, lan, lgw::lanEncode((uint8_t)(++lgwIdx), p, 5, lan));
+            if (nf < 32) devAddr[nf] = a;
+            Serial.printf("# SELF: eigenes Geraet %08lX gemeldet\n", (unsigned long)a);
+        }
+#endif
         devCount = nf;
         uint8_t dp[4] = { lgw::CMD_DISCDONE, 0, 0, 1 };
         sendLan(cli, cr, lan, lgw::lanEncode((uint8_t)(++lgwIdx), dp, 4, lan));

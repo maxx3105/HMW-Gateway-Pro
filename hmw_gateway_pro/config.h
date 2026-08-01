@@ -62,6 +62,15 @@ struct GwConfig {
     bool     useRetransmit = false;       // Kommando bei fehlender Antwort wiederholen (Master-Retransmit)
     uint8_t  sendRetries = 3;             // max. Sendeversuche (1 = kein Retransmit), wie hs485d MAX_SEND_RETRY
     String   webPass;                     // Web-UI-Login (leer = kein Login; Benutzer = admin)
+    // --- Selbst-Geraet: Gateway meldet sich zusaetzlich als HMW-Busgeraet an, damit es in der
+    //     CCU als konfigurierbares Geraet erscheint. Alle Werte ueber /config aenderbar, damit
+    //     das Ausprobieren von Typ/XML-Kombinationen KEINEN Reflash braucht. ---
+    bool     selfEnable  = true;          // Selbst-Geraet aktiv (aus = exakt bisheriges Verhalten)
+    uint32_t selfAddr    = 1129999999UL;  // eigene Busadresse (nur busweit eindeutig)
+    uint8_t  selfType    = 0x70;          // Geraetetyp-Byte (Antwort auf 'h'); muss zur XML passen
+    uint8_t  selfHw      = 0x01;          // HW-Version (Antwort auf 'h')
+    uint16_t selfFw      = 0x0102;        // FW-Version (Antwort auf 'v')
+    String   selfSerial  = "LGW0000001";  // Seriennummer (Antwort auf 'n'), GENAU 10 Zeichen
     bool     valid       = false;         // schon konfiguriert?
 };
 
@@ -96,6 +105,12 @@ inline void load(GwConfig& c) {
     c.useRetransmit = p.getBool("rtx", false);
     c.sendRetries = p.getUChar("rtxn", 3);
     c.webPass     = p.getString("webpass", "");
+    c.selfEnable  = p.getBool("selfen", true);
+    c.selfAddr    = p.getUInt("selfaddr", 1129999999UL);
+    c.selfType    = p.getUChar("selftype", 0x70);
+    c.selfHw      = p.getUChar("selfhw", 0x01);
+    c.selfFw      = p.getUShort("selffw", 0x0102);
+    c.selfSerial  = p.getString("selfser", "LGW0000001");
     p.end();
 }
 
@@ -127,6 +142,12 @@ inline void save(const GwConfig& c) {
     p.putBool("rtx", c.useRetransmit);
     p.putUChar("rtxn", c.sendRetries);
     p.putString("webpass", c.webPass);
+    p.putBool("selfen", c.selfEnable);
+    p.putUInt("selfaddr", c.selfAddr);
+    p.putUChar("selftype", c.selfType);
+    p.putUChar("selfhw", c.selfHw);
+    p.putUShort("selffw", c.selfFw);
+    p.putString("selfser", c.selfSerial);
     p.putBool("valid", true);
     p.end();
 }
