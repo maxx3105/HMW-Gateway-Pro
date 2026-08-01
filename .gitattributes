@@ -1,0 +1,3 @@
+# XML fuer die CCU MUSS LF behalten (hs485types), Markdown ebenso
+*.xml text eol=lf
+*.md  text eol=lf

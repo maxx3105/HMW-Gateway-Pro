@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!--
+  hmw_lgw_dual.xml : Geraetebeschreibung fuer das HMW-Gateway-Pro-Dual, damit das
+  Gateway SELBST als konfigurierbares Geraet in der OpenCCU erscheint (Analogie zum
+  HmIPW-DRAP: Betriebsart Ring/Split als Parameter am Geraet).
+
+  ENTWURF, am realen hs485types-Format (hbw_sys_pm.xml) modelliert, noch NICHT in
+  der CCU getestet. Vor Einsatz zu klaeren (§11 DUAL-BUS-KONZEPT.md):
+    - device-type-Byte 0x70 = HBW-LC-Sw8-DR. Auf der Test-CCU unkritisch (sw8 nicht
+      installiert); vor Produktion freies Byte (z.B. 0xB0), gegen volle Addon-Liste.
+    - Nimmt hs485d/OpenCCU es an, dass dasselbe LGW-Interface ZUSAETZLICH ein
+      Busgeraet auf einer Adresse ist? (empirisch pruefen)
+  Ablageort in OpenCCU: /firmware/hs485types/  (bzw. via jp-hb-devices-addon).
+  Encoding ISO-8859-1, kein UTF-8-BOM (sonst rendert die CCU Umlaute falsch).
+-->
+<device eep_size="1024" version="01">
+
+  <supported_types>
+    <type priority="2" id="HMW-LGW-Dual" name="RS485 Homebrew LAN Gateway Dual-Bus (Ring)">
+      <parameter const_value="0x70" size="1" index="0"/>                <!-- deviceType (Antwort auf 'h'). Hinweis: 0x70 = HBW-LC-Sw8-DR; vor Produktion freies Byte (z.B. 0xB0), falls sw8 im Einsatz -->
+      <parameter const_value="1"    size="1" index="1"/>                <!-- HW-Version (Antwort auf 'h') -->
+      <parameter const_value="0x0100" size="2" cond_op="GE" index="2"/> <!-- FW >= 1.00 (Antwort auf 'v') -->
+    </type>
+  </supported_types>
+
+  <!-- ================= Geraete-MASTER: die eigentliche Gateway-Konfiguration ============= -->
+  <!-- Diese Parameter liest/schreibt die CCU per Bus-Kmd 'R'/'W' auf die emulierte EEPROM   -->
+  <!-- des Gateways; 'C' uebernimmt sie in die NVS-Config (CFG). Siehe handleSelfFrame().    -->
+  <paramset id="hmw_lgw_dual_dev_master" type="MASTER">
+
+    <!-- Betriebsart: das Gegenstueck zum DRAP-Dropdown "Buskonfiguration" -->
+    <parameter id="BUS_MODE">
+      <logical type="option">
+        <option id="SINGLE"/>              <!-- 0: ein Bus, Bus B ungenutzt -->
+        <option id="RING" default="true"/> <!-- 1: Ring, Forwarding im Bruchfall -->
+        <option id="SPLIT"/>               <!-- 2: zwei getrennte Straenge -->
+      </logical>
+      <physical size="1.0" type="integer" interface="eeprom">
+        <address index="0x0001"/>
+      </physical>
+    </parameter>
+
+    <!-- Bruch-Erkennung (Hysterese) -->
+    <parameter id="RING_BREAK_THRESHOLD">
+      <logical type="integer" default="3" min="1" max="20"/>
+      <physical size="1.0" type="integer" interface="eeprom">
+        <address index="0x0002"/>
+      </physical>
+    </parameter>
+    <parameter id="RING_HEAL_THRESHOLD">
+      <logical type="integer" default="5" min="1" max="20"/>
+      <physical size="1.0" type="integer" interface="eeprom">
+        <address index="0x0003"/>
+      </physical>
+    </parameter>
+    <parameter id="RING_ECHO_TIMEOUT">
+      <logical type="integer" unit="ms" default="30" min="5" max="255"/>
+      <physical size="1.0" type="integer" interface="eeprom">
+        <address index="0x0004"/>
+      </physical>
+    </parameter>
+
+    <!-- Master-Retransmit (entspricht dem Web-Portal-Schalter) -->
+    <parameter id="RETRANSMIT">
+      <logical type="boolean" default="false"/>
+      <physical size="0.1" type="integer" interface="eeprom">
+        <address index="0x0005"/>
+      </physical>
+    </parameter>
+
+    <!-- Zentralen-Adresse: von der CCU beim Anlernen gesetzt (versteckt) -->
+    <parameter id="CENTRAL_ADDRESS" hidden="true">
+      <logical type="integer"/>
+      <physical size="4" type="integer" interface="eeprom">
+        <address index="0x0008"/>
+      </physical>
+    </parameter>
+
+    <!-- KEIN OWN_ADDRESS: es gibt genau EIN Gateway, seine Busadresse ist eine feste
+         Firmware-/NVS-Konstante (nicht aus der CCU editierbar). Damit entfaellt auch die
+         1120000000+N-Range-Bindung; die Adresse muss nur busweit eindeutig sein. -->
+
+  </paramset>
+
+  <!-- ================= Frames ================= -->
+  <frames>
+    <!-- Pro-Bus-Status: Abfrage (#S) + spontanes Ereignis (#i). channel_field trennt BUS 1/2. -->
+    <frame id="BUS_INFO_GET" type="#S" channel_field="10" direction="to_device"/>
+    <frame id="BUS_INFO_EVENT" type="#i" channel_field="10" direction="from_device" event="true">
+      <parameter type="integer" index="11.0" size="2.0" signed="false" param="OUTPUT_VOLTAGE"/> <!-- 0.01 V -->
+      <parameter type="integer" index="13.0" size="2.0" signed="false" param="CURRENT"/>        <!-- mA -->
+      <parameter type="integer" index="15.0" size="0.4" param="VOLTAGE_STATUS"/>
+      <parameter type="integer" index="15.4" size="0.4" param="CURRENT_STATUS"/>
+    </frame>
+    <!-- Geraeteweiter Ring-/Bruchzustand (Wartungskanal). -->
+    <frame id="RING_STATE_GET" type="#S" channel_field="10" direction="to_device"/>
+    <frame id="RING_STATE_EVENT" type="#i" channel_field="10" direction="from_device" event="true">
+      <parameter type="integer" index="11.0" size="0.4" param="RING_STATE"/>  <!-- 0=CLOSED 1=BROKEN_A 2=BROKEN_B 3=SPLIT -->
+      <parameter type="integer" index="11.4" size="0.1" param="RING_ERROR"/>  <!-- 1 = Ring gebrochen -->
+    </frame>
+  </frames>
+
+  <!-- ================= Kanaele ================= -->
+  <channels>
+
+    <!-- Kanal 0: Wartungskanal. UNREACH/CONFIG_PENDING wie ueblich + Ring-Status/Bruch.
+         ERROR_RING_BROKEN = sticky Servicemeldung, quittierbar (Analogie zu DRAP E16). -->
+    <channel index="0" type="MAINTENANCE" count="1" class="maintenance" ui_flags="internal">
+      <paramset id="maint_ch_master" type="MASTER"/>
+      <paramset id="maint_ch_values" type="VALUES">
+        <parameter id="UNREACH" ui_flags="service" operations="read,event">
+          <logical type="boolean"/>
+          <physical type="integer" interface="internal" value_id="UNREACH"/>
+        </parameter>
+        <parameter id="STICKY_UNREACH" ui_flags="service" operations="read,write,event">
+          <logical type="boolean"/>
+          <physical type="integer" interface="internal" value_id="STICKY_UNREACH"/>
+        </parameter>
+        <parameter id="CONFIG_PENDING" ui_flags="service" operations="read,event">
+          <logical type="boolean"/>
+          <physical type="integer" interface="internal" value_id="CONFIG_PENDING"/>
+        </parameter>
+        <parameter id="ERROR_RING_BROKEN" ui_flags="service" operations="read,write,event">
+          <logical type="boolean"/>
+          <physical type="integer" interface="command" value_id="RING_ERROR">
+            <event frame="RING_STATE_EVENT"/>
+          </physical>
+        </parameter>
+        <parameter id="RING_STATE" operations="read,event">
+          <logical type="option">
+            <option id="CLOSED" default="true"/> <!-- 0: Ring geschlossen -->
+            <option id="BROKEN_A"/>              <!-- 1: Bruch, Stub A aktiv -->
+            <option id="BROKEN_B"/>              <!-- 2: Bruch, Stub B aktiv -->
+            <option id="SPLIT"/>                 <!-- 3: zwei getrennte Straenge -->
+          </logical>
+          <physical type="integer" interface="command" value_id="RING_STATE">
+            <get request="RING_STATE_GET" response="RING_STATE_EVENT"/>
+            <event frame="RING_STATE_EVENT"/>
+          </physical>
+        </parameter>
+      </paramset>
+    </channel>
+
+    <!-- Kanaele 1+2: BUS 1 und BUS 2, je vier Werte wie beim DRAP (Screenshot):
+         Ausgangsspannung, Status Ausgangsspannung, Aktuelle Stromaufnahme, Status Stromaufnahme.
+         count="2" ab index 1 erzeugt Kanal :1 (BUS 1) und :2 (BUS 2).
+         ACHTUNG: braucht Mess-HW (Spannungsteiler+ADC je Zweig, Strom-Shunt), siehe
+         §3.4/§8 DUAL-BUS-KONZEPT.md. Ohne Messung bleiben die Werte Platzhalter. -->
+    <channel index="1" type="BUS" count="2" physical_index_offset="-1">
+      <paramset type="MASTER" id="hmw_lgw_bus_ch_master"/>
+      <paramset type="VALUES" id="hmw_lgw_bus_ch_values">
+        <parameter id="OUTPUT_VOLTAGE" operations="read,event">
+          <logical type="float" min="0.0" max="30.0" unit="V"/>
+          <physical type="integer" interface="command" value_id="OUTPUT_VOLTAGE">
+            <get request="BUS_INFO_GET" response="BUS_INFO_EVENT"/>
+            <event frame="BUS_INFO_EVENT"/>
+          </physical>
+          <conversion type="float_integer_scale" factor="100"/>
+        </parameter>
+        <parameter id="VOLTAGE_STATUS" operations="read,event">
+          <logical type="option">
+            <option id="Normal" default="true"/>
+            <option id="Over Voltage"/>
+            <option id="Under Voltage"/>
+          </logical>
+          <physical type="integer" interface="command" value_id="VOLTAGE_STATUS">
+            <get request="BUS_INFO_GET" response="BUS_INFO_EVENT"/>
+            <event frame="BUS_INFO_EVENT"/>
+          </physical>
+        </parameter>
+        <parameter id="CURRENT" operations="read,event">
+          <logical type="float" min="0.0" max="3200.0" unit="mA">
+            <!-- DRAP zeigt Werte unter 100 mA als "&lt; 100.0 mA" (Anleitung: nur > 100 mA). -->
+            <special_value id="&lt; 100.0 mA" value="0"/>
+          </logical>
+          <physical type="integer" interface="command" value_id="CURRENT">
+            <get request="BUS_INFO_GET" response="BUS_INFO_EVENT"/>
+            <event frame="BUS_INFO_EVENT"/>
+          </physical>
+          <conversion type="float_integer_scale" factor="1"/>
+        </parameter>
+        <parameter id="CURRENT_STATUS" operations="read,event">
+          <logical type="option">
+            <option id="Normal" default="true"/>
+            <option id="Overload"/>
+          </logical>
+          <physical type="integer" interface="command" value_id="CURRENT_STATUS">
+            <get request="BUS_INFO_GET" response="BUS_INFO_EVENT"/>
+            <event frame="BUS_INFO_EVENT"/>
+          </physical>
+        </parameter>
+      </paramset>
+    </channel>
+
+  </channels>
+</device>
