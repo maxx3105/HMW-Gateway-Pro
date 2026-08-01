@@ -9,6 +9,9 @@
   /firmware/fwmap, KEIN Kapern eines vorhandenen eq3-Geraetetyps.
   Hier: Typ 171 (0xAB), HW-Version 0 - muss mit /config im Gateway uebereinstimmen.
   const_value ist DEZIMAL (eq3-Konvention), Datei mit LF-Zeilenenden, ISO-8859-1 ohne BOM.
+  ACHTUNG: die Typ-id ("HMW-LGW-Dual") wird CASE-SENSITIV verglichen. Wer ein Geraetebild
+  oder Uebersetzungen ergaenzt (devdb.csv, Stringtable), muss sie zeichengenau uebernehmen -
+  Abweichungen melden keinen Fehler, das Bild fehlt dann einfach lautlos.
   Achtung: /firmware/ ueberlebt kein CCU-Update - fuer Dauerbetrieb per Addon ausliefern.
 
   Das EEPROM-Layout unten MUSS exakt zu encodeSelfEeprom()/applySelfEeprom() im Sketch passen.
