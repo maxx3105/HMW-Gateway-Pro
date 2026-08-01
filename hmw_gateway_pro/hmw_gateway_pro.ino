@@ -833,6 +833,11 @@ void busDiscover(uint32_t prefix, int fixed, uint32_t* found, int* nf) {
 //   0x000B  Unicast-Antwort-Wartezeit (2 B, ms)
 //   0x000D  CCU-Inaktivitaets-Timeout (2 B, s)
 static uint8_t selfEeprom[1024];
+// Die CCU schickt nach dem Schreiben KEIN 'C' (am echten System beobachtet: nur W, dann E/R).
+// Deshalb uebernehmen wir selbst, sobald nach dem letzten W kurz Ruhe war -- ein Schreibvorgang
+// besteht aus mehreren 16-Byte-Bloecken, die wir nicht einzeln ins NVS schreiben wollen.
+static volatile uint32_t g_selfWriteMs = 0;      // millis() des letzten W (0 = nichts offen)
+const uint32_t SELF_APPLY_DELAY_MS = 1500;
 
 static void encodeSelfEeprom() {          // CFG -> EEPROM-Abbild (Boot und nach Web-Aenderung)
     memset(selfEeprom, 0, sizeof(selfEeprom));
@@ -899,8 +904,9 @@ void handleSelfSend(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t
                     if ((uint16_t)n + 4 > f.dataLen) n = f.dataLen - 4;                     // nur wirklich vorhandene Bytes
                     for (uint8_t i = 0; i < n; i++)
                         if ((uint32_t)adr + i < sizeof(selfEeprom)) selfEeprom[adr + i] = f.data[4 + i];
+                    g_selfWriteMs = millis();                                              // -> verzoegert uebernehmen
                     if (g_debugBus) Serial.printf("# SELF W @0x%04X %u Byte\n", adr, n); } break;
-        case 'C': applySelfEeprom(); break;                                                // Konfiguration uebernehmen
+        case 'C': g_selfWriteMs = 0; applySelfEeprom(); break;                             // Konfiguration uebernehmen
         default:  al = 0; break;                                                            // generische leere Antwort
     }
     uint8_t respCtrl = 0x18 | (uint8_t)(((f.control >> 1) & 0x03) << 5);
@@ -1134,6 +1140,13 @@ void handleClient(WiFiClient& cli) {
         }
         if (off) { memmove(rx, rx + off, rxlen - off); rxlen -= off; }
         pollBusEvents(cli, cr, lgwIdx);
+#if SELF_DEVICE_ENABLE
+        // Schreibvorgang der CCU abgeschlossen (kein 'C' mehr abwarten) -> Config uebernehmen
+        if (g_selfWriteMs && millis() - g_selfWriteMs > SELF_APPLY_DELAY_MS) {
+            g_selfWriteMs = 0;
+            applySelfEeprom();
+        }
+#endif
         // Keine Keepalives mehr (CCU schickt 'K' alle 20s) -> Verbindung tot -> sauber schliessen,
         // damit die CCU das Close sieht und neu verbindet (statt am Zombie-Socket zu haengen).
         if (millis() - lastRx > (uint32_t)CFG.rxTimeoutS * 1000UL) {
