@@ -860,13 +860,24 @@ static void applySelfEeprom() {
     uint8_t  mode  = selfEeprom[0x0001];
     uint16_t ackMs = ((uint16_t)selfEeprom[0x000B] << 8) | selfEeprom[0x000C];
     uint16_t rxTo  = ((uint16_t)selfEeprom[0x000D] << 8) | selfEeprom[0x000E];
-    CFG.busMode         = (mode <= 2) ? mode : 0;
-    CFG.useCarrierSense = selfEeprom[0x0007] != 0;
-    CFG.busIdleMs       = selfEeprom[0x0008] ? selfEeprom[0x0008] : 5;
-    CFG.useRetransmit   = selfEeprom[0x0009] != 0;
-    CFG.sendRetries     = selfEeprom[0x000A] ? selfEeprom[0x000A] : 3;
-    if (ackMs >= 50  && ackMs <= 2000) CFG.ackWaitMs  = ackMs;
-    if (rxTo  >= 10  && rxTo  <= 3600) CFG.rxTimeoutS = rxTo;
+    GwConfig n = CFG;                     // Kandidat, erst pruefen, dann uebernehmen
+    n.busMode         = (mode <= 2) ? mode : 0;
+    n.useCarrierSense = selfEeprom[0x0007] != 0;
+    n.busIdleMs       = selfEeprom[0x0008] ? selfEeprom[0x0008] : 5;
+    n.useRetransmit   = selfEeprom[0x0009] != 0;
+    n.sendRetries     = selfEeprom[0x000A] ? selfEeprom[0x000A] : 3;
+    if (ackMs >= 50  && ackMs <= 2000) n.ackWaitMs  = ackMs;
+    if (rxTo  >= 10  && rxTo  <= 3600) n.rxTimeoutS = rxTo;
+
+    // NUR schreiben, wenn sich wirklich etwas geaendert hat. Die CCU schreibt bei jedem
+    // Erkennungsvorgang -- ein cfg::save() pro Durchlauf waere unnoetiger Flash-Verschleiss.
+    bool changed = n.busMode != CFG.busMode || n.useCarrierSense != CFG.useCarrierSense ||
+                   n.busIdleMs != CFG.busIdleMs || n.useRetransmit != CFG.useRetransmit ||
+                   n.sendRetries != CFG.sendRetries || n.ackWaitMs != CFG.ackWaitMs ||
+                   n.rxTimeoutS != CFG.rxTimeoutS;
+    if (!changed) { encodeSelfEeprom(); return; }
+
+    CFG = n;
     cfg::save(CFG);
     encodeSelfEeprom();                   // Klemmungen zurueckspiegeln
     Serial.printf("# SELF: Konfiguration uebernommen (busMode=%u cs=%u/%ums rtx=%u/%u ack=%ums rxto=%us)\n",
@@ -879,12 +890,16 @@ static void applySelfEeprom() {
 // Antwort-Control wie ein echtes Geraet: 0x18 | (Seq der Anfrage << 5), sonst
 // verwirft die CCU die Sequenznummer (vgl. HBWired.cpp sendFrameSingle).
 void handleSelfSend(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* emb, uint8_t elen) {
-    uint8_t bus[300]; size_t bl = lgw::embeddedToBus(emb, elen, bus);
-    hmw::Frame f;
+    // Puffer bewusst static: der Aufruf kommt ausschliesslich single-threaded aus handleLan,
+    // und auf dem Stack laegen hier sonst >1 KB zusaetzlich zu handleClient/handleLan.
+    static uint8_t bus[300];
+    static hmw::Frame f;
+    static uint8_t ans[64];
+    size_t bl = lgw::embeddedToBus(emb, elen, bus);
     if (!hmw::parseFrame(bus, bl, &f) || f.dataLen == 0) return;
     uint8_t cmd = f.data[0];
 
-    uint8_t ans[64]; uint8_t al = 0;
+    uint8_t al = 0;
     switch (cmd) {
         case 'h': ans[0] = CFG.selfType; ans[1] = CFG.selfHw; al = 2; break;               // Typ + HW-Version
         case 'v': ans[0] = (uint8_t)(CFG.selfFw >> 8); ans[1] = (uint8_t)CFG.selfFw; al = 2; break;
@@ -1576,6 +1591,24 @@ void setup() {
     Serial.begin(115200);
     bootMs = millis();
     Serial.printf("# HMW-LGW Firmware v%s (Build %s %s)\n", FW_VERSION, __DATE__, __TIME__);
+    // Reset-Grund protokollieren -- der Log liegt im RAM und ist nach einem Neustart weg;
+    // ohne diese Zeile bleibt ein spontaner Reboot unerklaerlich (Panic? Watchdog? Brownout?).
+    {   esp_reset_reason_t rr = esp_reset_reason();
+        const char* s;
+        switch (rr) {
+            case ESP_RST_POWERON:  s = "Power-On";                 break;
+            case ESP_RST_SW:       s = "Software-Neustart";        break;
+            case ESP_RST_PANIC:    s = "PANIC (Absturz!)";         break;
+            case ESP_RST_INT_WDT:  s = "Interrupt-Watchdog";       break;
+            case ESP_RST_TASK_WDT: s = "Task-Watchdog";            break;
+            case ESP_RST_WDT:      s = "anderer Watchdog";         break;
+            case ESP_RST_BROWNOUT: s = "BROWNOUT (Spannung!)";     break;
+            case ESP_RST_DEEPSLEEP:s = "Deep-Sleep";               break;
+            case ESP_RST_EXT:      s = "externer Reset";           break;
+            default:               s = "unbekannt";                break;
+        }
+        Serial.printf("# Reset-Grund: %s (%d)\n", s, (int)rr);
+    }
     Tap.begin();
     Capture.begin();
     Tap.setSink(captureSink);   // jeder Tap-Eintrag geht zusaetzlich in den Recorder (nur wenn aktiv)
