@@ -384,10 +384,11 @@ gesendetes Frame auf Bus B ankommt. Wenn **ja**, sind die Ports in Wahrheit verb
 - **Bruch-Meldung an die CCU:** Der DRAP meldet den Bruch als Servicemeldung — er ist
   ein angelerntes Gerät mit Wartungskanal. Behandelt man das Gateway nur als reines
   **Interface**, ist keine Servicemeldung möglich (nur Web-UI-Status, Log, Push/MQTT).
-  **Aufgehoben durch §11:** meldet sich das Gateway zusätzlich als *eigenes* Busgerät
-  an, kann es den Ringbruch sehr wohl als Servicemeldung an die CCU schicken — der
-  Wartungskanal `ERROR_RING_BROKEN` in `ccu/hs485types/hmw_lgw_dual.xml` tut genau das.
-  Mindestanforderung bleibt: die Web-Statusseite zeigt den Ringzustand.
+  **Aufgehoben durch §11 — am echten System verifiziert:** Das Gateway meldet sich
+  zusätzlich als *eigenes* Busgerät an und erscheint als **HMW-LGW-Dual** mit
+  Wartungskanal. Damit kann es den Ringbruch als Servicemeldung an die CCU schicken
+  (`ERROR_RING_BROKEN`, in der vollen XML-Fassung). Mindestanforderung bleibt: die
+  Web-Statusseite zeigt den Ringzustand.
 - **Strommessung/Übertemperatur (E10/E11):** braucht Zusatz-HW (Shunt+ADC / NTC).
   Für die reine Dual-Bus-Funktion optional; ohne sie keine E11/E14/E16-Analogie.
 - **Kurzschluss:** Ring rettet ihn nicht; nur aktives zweigweises Abwerfen (§3.4).
@@ -545,13 +546,25 @@ dieselbe `CFG`/NVS. Regeln:
 - Konfliktregel festlegen (Vorschlag: letzter Schreiber gewinnt; CCU-Read triggert
   `CONFIG_PENDING`, bis übernommen).
 
-### 11.5 Die eine offene Frage (empirisch klären)
+### 11.5 Status: am echten System VERIFIZIERT (2026-08-01)
 
-Ob `hs485d`/OpenCCU akzeptiert, dass **dasselbe LGW-Interface zusätzlich ein Busgerät**
-auf einer Adresse ist, ist nicht verifiziert. Der DRAP macht genau das — aber auf der
-HmIP-Seite. Für HMW sehr wahrscheinlich (adressbasierter Geräte-Layer), aber zu prüfen.
+`hs485d`/OpenCCU akzeptiert, dass dasselbe LGW-Interface **zusätzlich ein Busgerät** auf
+einer eigenen Adresse ist. Nachgewiesen mit Typ **171 (0xAB)**, Serial `LGW0000002`:
+Das Gerät erscheint als **HMW-LGW-Dual**, Funktionstest OK, die CCU liest und schreibt die
+Konfiguration, und die Geräteparameter-Seite zeigt `BUS_MODE`, `CARRIER_SENSE`,
+`BUS_IDLE_TIME`, `RETRANSMIT`, `SEND_RETRIES`, `ACK_WAIT_TIME`, `RX_TIMEOUT`.
 
-**Billiger Test (ohne eine Zeile neuen Config-Code):** dem Gateway eine Bus-Adresse
-geben, es bei Discovery mit einem *vorhandenen* Typ (z. B. `h`→ ein bekanntes Byte)
-antworten lassen und schauen, ob OpenCCU es im Posteingang zeigt und interrogieren kann.
-Erscheint es → der Rest ist XML-Fleißarbeit.
+Erkenntnisse aus der Inbetriebnahme:
+
+- **Ein eigenes Typ-Byte genügt.** Es braucht **nur** diese XML in `/firmware/hs485types/`.
+  Kein Eintrag in `/firmware/fwmap`, kein Kapern eines vorhandenen eq3-Gerätetyps.
+- **Die CCU sendet kein `C`.** Nach dem Schreiben folgen nur `E`/`R`. Das Gateway übernimmt
+  deshalb selbst, 1,5 s nach dem letzten `W`-Block (§6/Firmware).
+- **`/firmware/` überlebt kein CCU-Update.** Für den Dauerbetrieb gehört die XML in ein
+  Addon (`/usr/local/…`), sonst ist sie nach jedem Update weg und das Gerät fällt auf
+  „HMW-Generic" zurück.
+- **Diagnose-Reihenfolge:** Bei „HMW-Generic + Fehler" zuerst prüfen, ob die XML auf der
+  CCU liegt, an der das Gateway wirklich hängt (bei mehreren CCUs die IP von WebUI und SSH
+  gegenprüfen!), und ob `hs485d` stabil läuft (`/var/log/messages`, kein `logread`).
+  Ein totes LGW-Interface in `/var/etc/hs485d.conf` legt `hs485d` in eine Restart-Schleife
+  und bricht jede laufende Erkennung ab.

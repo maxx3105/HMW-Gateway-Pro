@@ -4,12 +4,12 @@
   Das Gateway meldet sich zusaetzlich als HMW-Busgeraet an und wird dadurch in der CCU
   konfigurierbar (Vorbild HmIPW-DRAP: Betriebsart als Geraeteparameter).
 
-  WICHTIG - Typ-Byte: Eine CCU OHNE jp-hb-devices-addon typisiert ein FREI ERFUNDENES Typ-Byte
-  nicht (weder hs485types-XML noch /firmware/fwmap reichen) -> Geraet bleibt "HMW-Generic".
-  Erprobter Weg: den Slot eines vorhandenen, ungenutzten eq3-Typs uebernehmen. Hier: 22 (0x16)
-  = HMW-IO-SR-FM. Dazu diese Datei als /firmware/hs485types/hmw_io_sr_fm.xml ablegen
-  (Original vorher sichern!) und im Gateway unter /config den Geraetetyp auf 22 stellen.
-  const_value ist DEZIMAL (eq3-Konvention), Datei mit LF-Zeilenenden und ISO-8859-1 ohne BOM.
+  VERIFIZIERT am echten System (OpenCCU): Ein EIGENES Typ-Byte funktioniert - es braucht
+  NUR diese XML in /firmware/hs485types/ der CCU, an der das Gateway haengt. KEIN Eintrag in
+  /firmware/fwmap, KEIN Kapern eines vorhandenen eq3-Geraetetyps.
+  Hier: Typ 171 (0xAB), HW-Version 0 - muss mit /config im Gateway uebereinstimmen.
+  const_value ist DEZIMAL (eq3-Konvention), Datei mit LF-Zeilenenden, ISO-8859-1 ohne BOM.
+  Achtung: /firmware/ ueberlebt kein CCU-Update - fuer Dauerbetrieb per Addon ausliefern.
 
   Das EEPROM-Layout unten MUSS exakt zu encodeSelfEeprom()/applySelfEeprom() im Sketch passen.
 -->
@@ -17,8 +17,8 @@
 
   <supported_types>
     <type id="HMW-LGW-Dual" name="RS485 Homebrew LAN Gateway Dual-Bus" priority="2">
-      <parameter const_value="22" index="0" size="1"/>   <!-- deviceType ('h'); 22 = 0x16 -->
-      <parameter const_value="1"  index="1" size="1"/>   <!-- HW-Version ('h') -->
+      <parameter const_value="171" index="0" size="1"/>  <!-- deviceType ('h'); 171 = 0xAB -->
+      <parameter const_value="0"  index="1" size="1"/>   <!-- HW-Version ('h') -->
     </type>
   </supported_types>
 

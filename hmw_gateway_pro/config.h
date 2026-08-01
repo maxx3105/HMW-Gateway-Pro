@@ -67,8 +67,8 @@ struct GwConfig {
     //     das Ausprobieren von Typ/XML-Kombinationen KEINEN Reflash braucht. ---
     bool     selfEnable  = true;          // Selbst-Geraet aktiv (aus = exakt bisheriges Verhalten)
     uint32_t selfAddr    = 1129999999UL;  // eigene Busadresse (nur busweit eindeutig)
-    uint8_t  selfType    = 0x70;          // Geraetetyp-Byte (Antwort auf 'h'); muss zur XML passen
-    uint8_t  selfHw      = 0x01;          // HW-Version (Antwort auf 'h')
+    uint8_t  selfType    = 0xAB;          // Geraetetyp-Byte (Antwort auf 'h'); muss zur XML passen (171)
+    uint8_t  selfHw      = 0x00;          // HW-Version (Antwort auf 'h')
     uint16_t selfFw      = 0x0102;        // FW-Version (Antwort auf 'v')
     String   selfSerial  = "LGW0000001";  // Seriennummer (Antwort auf 'n'), GENAU 10 Zeichen
     // Bus-Betriebsart: 0=SINGLE (ein Bus), 1=RING, 2=SPLIT. Wird schon gespeichert und ist in
@@ -110,8 +110,8 @@ inline void load(GwConfig& c) {
     c.webPass     = p.getString("webpass", "");
     c.selfEnable  = p.getBool("selfen", true);
     c.selfAddr    = p.getUInt("selfaddr", 1129999999UL);
-    c.selfType    = p.getUChar("selftype", 0x70);
-    c.selfHw      = p.getUChar("selfhw", 0x01);
+    c.selfType    = p.getUChar("selftype", 0xAB);
+    c.selfHw      = p.getUChar("selfhw", 0x00);
     c.selfFw      = p.getUShort("selffw", 0x0102);
     c.selfSerial  = p.getString("selfser", "LGW0000001");
     c.busMode     = p.getUChar("busmode", 0);
