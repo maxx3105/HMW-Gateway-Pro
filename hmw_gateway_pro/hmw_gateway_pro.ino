@@ -827,6 +827,7 @@ struct BusPort {
     }
     inline void setTx(bool on) { if (de >= 0) digitalWrite(de, (on != deInv) ? HIGH : LOW); }
     inline int  available()    { return uart.available(); }
+    inline int  readByte()     { return uart.read(); }
     inline void drain()        { while (uart.available()) uart.read(); }
 
     void send(const uint8_t* data, size_t len) {
@@ -895,11 +896,18 @@ void busSend(const uint8_t* data, size_t len) {
 
     if (!test) { busB.send(data, len); return; }             // Bruch bekannt -> ohne Wartezeit
 
+    // Echo INHALTLICH pruefen, nicht nur "es kam etwas an": Auf dem Bus liegen Geraete-
+    // Telegramme, und im Bruchbetrieb laufen eigene Frames als Ruecklaeufer ein. Nur wenn
+    // exakt das eben gesendete Frame zurueckkommt, ist die Schleife wirklich geschlossen.
     g_ringTestMs = millis();
+    uint8_t  echo[64];
+    size_t   want = (len < sizeof(echo)) ? len : sizeof(echo);
+    size_t   got  = 0;
     uint32_t t0 = millis();
-    while (!busB.available() && millis() - t0 < CFG.ringEchoMs) { /* Echo abwarten */ }
-    bool heard = busB.available();
-    busB.drain();                                            // Echo verwerfen, ist kein Bus-Event
+    while (got < want && millis() - t0 < CFG.ringEchoMs)
+        while (busB.available() && got < want) echo[got++] = (uint8_t)busB.readByte();
+    bool heard = (got == want) && (memcmp(echo, data, want) == 0);
+    busB.drain();                                            // Rest verwerfen, ist kein Bus-Event
     if (!heard) busB.send(data, len);                        // getrennt -> zweiten Stich bedienen
     ringNoteEcho(heard);
 }
@@ -964,6 +972,11 @@ void ringIdleCheck() {
     uint8_t out[16];
     size_t n = hmw::buildFrame(CFG.selfAddr, 0x19, hmw::CENTRAL, nullptr, 0, out, true);
     busSend(out, n);
+    // Im geschlossenen Ring laeuft das Testframe auch auf Bus A wieder ein. Auf dieses ACK
+    // antwortet niemand, also den Ruecklaeufer gleich abraeumen -- sonst taucht das eigene
+    // Frame als vermeintliches Bus-Event auf und muellt den Sniffer voll.
+    uint32_t t0 = millis();
+    while (millis() - t0 < 15) { if (busA.available()) busA.drain(); }
 }
 
 void busAck(uint32_t dev, uint8_t devControl) {
