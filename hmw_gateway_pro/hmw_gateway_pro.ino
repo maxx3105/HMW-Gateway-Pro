@@ -300,8 +300,10 @@ String formHtml() {
          "> als HMW-Ger&auml;t in der CCU anmelden</label>";
     h += "<label>Busadresse (dez oder 0x&hellip;)</label><input name=selfaddr value='" + String(CFG.selfAddr) +
          "'><small>aktuell 0x" + String(CFG.selfAddr, HEX) + "</small>";
-    h += "<label>Ger&auml;tetyp (dez oder 0x&hellip;) &middot; muss zur XML passen</label><input name=selftype value='" +
-         String(CFG.selfType) + "'><small>aktuell 0x" + String(CFG.selfType, HEX) + " = " + String(CFG.selfType) + " dez</small>";
+    h += "<label>Ger&auml;tetyp (dez oder 0x&hellip;)</label><input name=selftype value='" + String(CFG.selfType) +
+         "'><small>In der hs485types-XML <b>genau so</b> eintragen: <code>const_value=\"0x" +
+         String(CFG.selfType, HEX) + "\"</code> (klein!) &ndash; entspricht " + String(CFG.selfType) +
+         " dezimal. Bei abweichender Schreibweise wird der Typ nicht erkannt.</small>";
     h += "<label>HW-Version</label><input name=selfhw type=number value='" + String(CFG.selfHw) + "'>";
     h += "<label>FW-Version (dez oder 0x&hellip;)</label><input name=selffw value='" + String(CFG.selfFw) +
          "'><small>aktuell 0x" + String(CFG.selfFw, HEX) + "</small>";

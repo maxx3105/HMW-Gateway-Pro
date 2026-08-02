@@ -7,11 +7,18 @@
   VERIFIZIERT am echten System (OpenCCU): Ein EIGENES Typ-Byte funktioniert - es braucht
   NUR diese XML in /firmware/hs485types/ der CCU, an der das Gateway haengt. KEIN Eintrag in
   /firmware/fwmap, KEIN Kapern eines vorhandenen eq3-Geraetetyps.
-  Hier: Typ 171 (0xAB), HW-Version 0 - muss mit /config im Gateway uebereinstimmen.
-  const_value ist DEZIMAL (eq3-Konvention), Datei mit LF-Zeilenenden, ISO-8859-1 ohne BOM.
-  ACHTUNG: die Typ-id ("HMW-LGW-Dual") wird CASE-SENSITIV verglichen. Wer ein Geraetebild
-  oder Uebersetzungen ergaenzt (devdb.csv, Stringtable), muss sie zeichengenau uebernehmen -
-  Abweichungen melden keinen Fehler, das Bild fehlt dann einfach lautlos.
+  Hier: Typ 0xab (= 171), HW-Version 0 - muss mit /config im Gateway uebereinstimmen.
+
+  SCHREIBWEISE (am System festgestellt): const_value hier als Hex mit KLEINEN Buchstaben
+  ("0xab"), passend zur Anzeige des Gateways. Bei "0xAB" wurde der Typ nicht erkannt.
+  eq3-eigene XMLs schreiben stattdessen dezimal ("27" = 0x1B) - das ist ebenfalls gaengig,
+  hier aber ungetestet. Wer die Schreibweise aendert: danach neu erkennen lassen und
+  pruefen, ob das Geraet noch mit eigener Typenbezeichnung erscheint.
+
+  Datei mit LF-Zeilenenden, ISO-8859-1 ohne BOM.
+  ACHTUNG: auch die Typ-id ("HMW-LGW-Dual") wird CASE-SENSITIV verglichen. Wer ein
+  Geraetebild oder Uebersetzungen ergaenzt (devdb.csv, Stringtable), muss sie zeichengenau
+  uebernehmen - Abweichungen melden keinen Fehler, das Bild fehlt dann einfach lautlos.
   Achtung: /firmware/ ueberlebt kein CCU-Update - fuer Dauerbetrieb per Addon ausliefern.
 
   Das EEPROM-Layout unten MUSS exakt zu encodeSelfEeprom()/applySelfEeprom() im Sketch passen.
@@ -20,7 +27,7 @@
 
   <supported_types>
     <type id="HMW-LGW-Dual" name="RS485 Homebrew LAN Gateway Dual-Bus" priority="2">
-      <parameter const_value="171" index="0" size="1"/>  <!-- deviceType ('h'); 171 = 0xAB -->
+      <parameter const_value="0xab" index="0" size="1"/> <!-- deviceType ('h'); 0xab = 171. KLEIN schreiben, s.o. -->
       <parameter const_value="0"  index="1" size="1"/>   <!-- HW-Version ('h') -->
     </type>
   </supported_types>
