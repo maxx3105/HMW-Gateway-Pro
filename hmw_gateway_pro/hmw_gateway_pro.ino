@@ -40,6 +40,12 @@
 #define GH_OWNER "maxx3105"
 #define GH_REPO  "HMW-Gateway-Pro"
 
+// Auto-Update-Pruefung komplett abschaltbar (0). Normalerweise nicht noetig: es wird nur
+// eine NEUERE Version von selbst angeboten, ein aelteres Release ausschliesslich ueber den
+// ausdruecklich beschrifteten Downgrade-Knopf. Auf 0 setzen, wenn ein Geraet gar keine
+// Releases dieses Repos ziehen soll (z.B. Testgeraet mit unveroeffentlichtem Stand).
+#define GH_UPDATE_ENABLED 1
+
 // Aufzeichnung (/capture): Groesse des RAM-Mitschnitt-Puffers. malloc erst bei "Start",
 // im Ruhezustand 0 Byte -> kein Dauerverbrauch. ~32 KB fassen mehrere hundert decodierte
 // Telegramme -- genug fuer einen kompletten Anlern-Mitschnitt.
@@ -152,7 +158,10 @@ BusStats        g_stats;
 //     cross-task gelesen -> kein Realloc (konsistent mit lastEvent). ---
 char            g_updLatest[16] = "";    // zuletzt ermittelte neueste Version (ohne 'v')
 char            g_updStatus[72] = "noch nicht geprueft";
-volatile bool   g_updAvail   = false;    // neuere Version verfuegbar?
+volatile bool   g_updAvail   = false;    // NEUERE Version verfuegbar (normaler Update-Knopf)
+volatile bool   g_updOlder   = false;    // Release ist AELTER als die installierte Version
+                                         // -> kein automatisches Angebot, aber bewusster
+                                         //    Downgrade ueber einen eigenen Knopf moeglich
 volatile bool   g_doCheckUpd = false;    // Web -> loop: Release pruefen
 volatile bool   g_doInstall  = false;    // Web -> loop: Update installieren
 static void setUpdStatus(const char* fmt, ...) {
@@ -383,6 +392,13 @@ String updateHtml() {
     if (g_updAvail)
         h += " <form method=POST action=/doupdate style='display:inline'>"
              "<button type=submit style='background:var(--ok)'>v" + esc(g_updLatest) + " installieren</button></form>";
+    else if (g_updOlder)   // bewusster Downgrade: eigener Knopf, eigene Farbe, eigene Nachfrage
+        h += " <form method=POST action=/doupdate style='display:inline' "
+             "onsubmit=\"return confirm('Downgrade auf v" + esc(g_updLatest) +
+             "? Die laufende Version v" FW_VERSION " ist neuer.')\">"
+             "<input type=hidden name=downgrade value=1>"
+             "<button type=submit style='background:var(--bad)'>&darr; Downgrade auf v" +
+             esc(g_updLatest) + "</button></form>";
     // --- manueller Upload (Fallback) ---
     h += F("<h2>Manuell (.bin hochladen)</h2>"
            "<form method=POST action=/update enctype='multipart/form-data'>"
@@ -1221,7 +1237,30 @@ bool netStart() {                       // true = IP bezogen
 // ============================== Auto-Update ================================= //
 // Fragt das neueste GitHub-Release ab und vergleicht dessen Version mit FW_VERSION.
 // BLOCKIEREND (HTTPS, ~2 s) -> nur aus dem loop aufrufen, nie aus dem Async-Web-Callback.
+// Vergleicht zwei Versionsstrings ("1.3.0", "1.2.2", auch "1.3.0-selftest").
+// Rueckgabe >0 wenn a neuer als b, 0 bei gleich, <0 wenn aelter. Verglichen werden die
+// Zahlen vor einem etwaigen '-'; ein Suffix ("-selftest", "-pre.1") gilt als AELTER als
+// dieselbe Version ohne Suffix (Semver-Konvention fuer Vorabversionen).
+static int versionCmp(const char* a, const char* b) {
+    for (int i = 0; i < 3; i++) {
+        long na = strtol(a, (char**)&a, 10);
+        long nb = strtol(b, (char**)&b, 10);
+        if (na != nb) return (na > nb) ? 1 : -1;
+        if (*a == '.') a++;
+        if (*b == '.') b++;
+    }
+    bool preA = (*a == '-'), preB = (*b == '-');       // Vorabversion?
+    if (preA != preB) return preA ? -1 : 1;            // mit Suffix = aelter
+    return 0;
+}
+
 bool updateCheck() {
+#if !GH_UPDATE_ENABLED
+    setUpdStatus("auf diesem Firmware-Zweig deaktiviert");
+    g_updAvail = false;
+    Serial.println("# Update-Check: deaktiviert (GH_UPDATE_ENABLED=0)");
+    return false;
+#endif
     if (!netUp()) { setUpdStatus("kein Netz"); return false; }
     WiFiClientSecure client; client.setInsecure();   // GitHub, kein Cert-Check; .bin-Integritaet prueft Update.h
     HTTPClient http;
@@ -1241,9 +1280,18 @@ bool updateCheck() {
     String tag = body.substring(q1 + 1, q2);          // z.B. "v1.1.1"
     String ver = tag.startsWith("v") ? tag.substring(1) : tag;
     snprintf(g_updLatest, sizeof(g_updLatest), "%s", ver.c_str());
-    g_updAvail = (strlen(g_updLatest) > 0) && (strcmp(g_updLatest, FW_VERSION) != 0);
-    if (g_updAvail) setUpdStatus("Update verfuegbar: v%s", g_updLatest);
-    else            setUpdStatus("aktuell (v" FW_VERSION ")");
+    // NUR neuere Versionen anbieten. Frueher galt "ungleich" -- damit wurde auch ein
+    // AELTERES Release als Update gemeldet und ein Klick darauf war ein stiller Downgrade.
+    // NUR neuere Versionen von selbst anbieten. Frueher galt "ungleich" -- damit wurde auch
+    // ein AELTERES Release als Update gemeldet und ein Klick darauf war ein stiller Downgrade.
+    // Ein aelteres Release wird weiterhin angezeigt, aber nur ueber einen eigenen,
+    // ausdruecklich als Downgrade beschrifteten Knopf installiert.
+    int cmp = versionCmp(g_updLatest, FW_VERSION);
+    g_updAvail = (strlen(g_updLatest) > 0) && (cmp > 0);
+    g_updOlder = (strlen(g_updLatest) > 0) && (cmp < 0);
+    if (g_updAvail)      setUpdStatus("Update verfuegbar: v%s", g_updLatest);
+    else if (g_updOlder) setUpdStatus("installiert v" FW_VERSION " ist neuer als Release v%s", g_updLatest);
+    else                 setUpdStatus("aktuell (v" FW_VERSION ")");
     Serial.printf("# Update-Check: installiert v%s, neuestes v%s -> %s\n",
                   FW_VERSION, g_updLatest, g_updAvail ? "UPDATE" : "aktuell");
     return true;
@@ -1538,7 +1586,9 @@ void runGateway() {
     });
     webServer.on("/doupdate", HTTP_POST, [](AsyncWebServerRequest* r) {
         if (authFail(r)) return;
-        if (g_updAvail) g_doInstall = true;
+        // Normalfall: nur neuere Version. Downgrade nur mit ausdruecklichem Parameter
+        // aus dem eigens beschrifteten Knopf (siehe updateHtml).
+        if (g_updAvail || (g_updOlder && r->hasParam("downgrade", true))) g_doInstall = true;
         r->redirect("/update");
     });
     // --- Bus-Firmware-Update: eine .hex ueber den Bus in ein HBWired-Geraet flashen ---
