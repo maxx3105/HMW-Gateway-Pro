@@ -123,7 +123,7 @@ volatile int    devCount = 0;
 char            lastEvent[48] = "-";
 uint32_t        lastQueryAddr = 0;       // Ziel der letzten Unicast-Abfrage (De-Dup fuer spurious 'e')
 uint32_t        lastQueryMs   = 0;
-volatile uint32_t busLastRxMs = 0;       // millis() des letzten Bus-Bytes (Carrier-Sense)
+// (Zeitpunkt des letzten Bus-Bytes liegt jetzt pro Port in BusPort::lastRxMs)
 
 // --- Frame-Tap: decodierte Bus-Telegramme fuer den Live-Sniffer (/sniffer) + Zaehler.
 //     Geschrieben aus dem Gateway-Loop (Tap-Aufrufe unten), gelesen vom Async-Web-Task.
@@ -750,14 +750,44 @@ void watchdogBegin() {
 inline void watchdogFeed() { esp_task_wdt_reset(); }
 
 // ============================== RS485-Bus =================================== //
-inline void busTx(bool on) { if (CFG.rs485De >= 0) digitalWrite(CFG.rs485De, (on != CFG.rs485DeInv) ? HIGH : LOW); }
-void busSend(const uint8_t* data, size_t len) {
-    busTx(true);
-    Serial2.write(data, len);
-    Serial2.flush();                              // wartet (modern) auf TX-Done
-    if (CFG.rs485De >= 0) delayMicroseconds(700); // letztes Byte sicher draussen, bevor DE auf RX faellt
-    busTx(false);
-}
+// Ein Busanschluss, gekapselt: eigener UART, eigene Pins, eigene Idle-Zeit. Vorbereitung
+// fuer den zweiten Port (Ring/Split, siehe DUAL-BUS-KONZEPT.md §6). Solange nur busA
+// existiert, ist das Verhalten identisch zum bisherigen Single-Bus-Code -- die bekannten
+// bus*()-Funktionen bleiben als duenne Wrapper auf busA bestehen.
+struct BusPort {
+    HardwareSerial&   uart;
+    int8_t            de     = -1;
+    bool              deInv  = false;
+    volatile uint32_t lastRxMs = 0;      // millis() des letzten empfangenen Bytes (Carrier-Sense)
+
+    explicit BusPort(HardwareSerial& u) : uart(u) {}
+
+    void begin(int8_t rxPin, int8_t txPin, int8_t dePin, bool inv, uint32_t baud) {
+        de = dePin; deInv = inv;
+        if (de >= 0) { pinMode(de, OUTPUT); setTx(false); }   // Idle = Empfangen (respektiert Invert)
+        // HMW-Bus = 8E1 (even parity)! Strenge HW-UARTs (z.B. ATmega32A) verwerfen sonst jeden Frame
+        uart.begin(baud, SERIAL_8E1, rxPin, txPin);
+    }
+    inline void setTx(bool on) { if (de >= 0) digitalWrite(de, (on != deInv) ? HIGH : LOW); }
+    inline int  available()    { return uart.available(); }
+    inline void drain()        { while (uart.available()) uart.read(); }
+
+    void send(const uint8_t* data, size_t len) {
+        setTx(true);
+        uart.write(data, len);
+        uart.flush();                             // wartet (modern) auf TX-Done
+        if (de >= 0) delayMicroseconds(700);      // letztes Byte sicher draussen, bevor DE auf RX faellt
+        setTx(false);
+    }
+    void   waitIdle();
+    size_t read(uint8_t* buf, size_t maxlen, uint32_t windowMs);
+    size_t readResponse(uint8_t* buf, size_t maxlen, uint32_t firstWaitMs, uint32_t gapMs);
+};
+
+BusPort busA(Serial2);                   // Bus A -- der bisherige (einzige) Anschluss
+
+inline void busTx(bool on) { busA.setTx(on); }
+void busSend(const uint8_t* data, size_t len) { busA.send(data, len); }
 // CSMA/CA Carrier-Sense vor einem Master-Sendevorgang: wartet, bis der Bus mind.
 // CFG.busIdleMs am Stueck still war (max. BUS_CS_MAX_WAIT_MS), danach kurzer Zufalls-
 // Backoff gegen zeitgleichen Zugriff. NUR im CMD_SEND-Pfad aufrufen -- NICHT vor
@@ -768,12 +798,12 @@ void busSend(const uint8_t* data, size_t len) {
 // busAck und wiederholt sein Event, die CCU wiederholt ihr Kommando mangels 'r' --
 // kein Datenverlust, nur der seltene echte Kollisionsfall kostet eine Runde. Im
 // Normalfall (Bus zum Sendezeitpunkt frei) kehrt die Funktion praktisch sofort zurueck.
-void busWaitIdle() {
+void BusPort::waitIdle() {
     if (!CFG.useCarrierSense) return;
     uint32_t deadline = millis() + BUS_CS_MAX_WAIT_MS;
     for (;;) {
-        while (Serial2.available()) { Serial2.read(); busLastRxMs = millis(); }
-        if (millis() - busLastRxMs >= CFG.busIdleMs) break;   // lang genug still -> Bus frei
+        while (uart.available()) { uart.read(); lastRxMs = millis(); }
+        if (millis() - lastRxMs >= CFG.busIdleMs) break;      // lang genug still -> Bus frei
         if ((int32_t)(millis() - deadline) >= 0) {            // Bus dauerbelegt -> trotzdem senden
             if (g_debugBus) Serial.println("# Carrier-Sense: Timeout, sende trotzdem");
             break;
@@ -781,24 +811,30 @@ void busWaitIdle() {
     }
     delayMicroseconds(esp_random() % 500);        // 0..500 us Backoff
 }
-size_t busRead(uint8_t* buf, size_t maxlen, uint32_t windowMs) {
+void busWaitIdle() { busA.waitIdle(); }
+
+size_t BusPort::read(uint8_t* buf, size_t maxlen, uint32_t windowMs) {
     size_t n = 0; uint32_t last = millis();
     while (millis() - last < windowMs)
-        while (Serial2.available() && n < maxlen) { buf[n++] = Serial2.read(); last = millis(); busLastRxMs = last; }
+        while (uart.available() && n < maxlen) { buf[n++] = uart.read(); last = millis(); lastRxMs = last; }
     return n;
 }
+size_t busRead(uint8_t* buf, size_t maxlen, uint32_t windowMs) { return busA.read(buf, maxlen, windowMs); }
 // Wie busRead, aber wartet bis firstWaitMs auf das ERSTE Byte (Geraet hat Carrier-
 // Sense-Backoff!), danach nur kurze Inter-Byte-Luecke. Verhindert, dass langsame
 // Antworten das Unicast-Fenster verpassen und faelschlich als 'e' (statt 'r') gehen.
-size_t busReadResponse(uint8_t* buf, size_t maxlen, uint32_t firstWaitMs, uint32_t gapMs) {
+size_t BusPort::readResponse(uint8_t* buf, size_t maxlen, uint32_t firstWaitMs, uint32_t gapMs) {
     size_t n = 0; uint32_t start = millis();
     while (n == 0 && millis() - start < firstWaitMs)
-        while (Serial2.available() && n < maxlen) { buf[n++] = Serial2.read(); busLastRxMs = millis(); }
+        while (uart.available() && n < maxlen) { buf[n++] = uart.read(); lastRxMs = millis(); }
     if (n == 0) return 0;
     uint32_t last = millis();
     while (millis() - last < gapMs)
-        while (Serial2.available() && n < maxlen) { buf[n++] = Serial2.read(); last = millis(); busLastRxMs = last; }
+        while (uart.available() && n < maxlen) { buf[n++] = uart.read(); last = millis(); lastRxMs = last; }
     return n;
+}
+size_t busReadResponse(uint8_t* buf, size_t maxlen, uint32_t firstWaitMs, uint32_t gapMs) {
+    return busA.readResponse(buf, maxlen, firstWaitMs, gapMs);
 }
 // len02-ACK an ein Geraet. Basis 0x19 + txSeqNum (Bits 6-5 des Geraete-Frames).
 // Das echte LGW quittiert jede adressierte Geraete-Antwort auf Bus-Ebene -- ohne
@@ -815,7 +851,7 @@ bool busProbe(uint32_t prefix, uint8_t validBits) {
     uint8_t out[16];
     uint8_t ctrl = (uint8_t)((((validBits - 1) & 0x1F) << 3) | 0x03);
     size_t n = hmw::buildFrame(prefix, ctrl, 0, nullptr, 0, out, false);
-    while (Serial2.available()) Serial2.read();
+    busA.drain();
     busSend(out, n);
     uint8_t tmp[64];
     size_t got = busRead(tmp, sizeof(tmp), PROBE_WINDOW_MS);
@@ -1000,7 +1036,7 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
                     if (g_debugBus) Serial.printf("# Retransmit %u/%u -> %08lX\n",
                                                   attempt, tries, (unsigned long)lastQueryAddr);
                     busWaitIdle();
-                    while (Serial2.available()) Serial2.read();
+                    busA.drain();
                     busSend(bus, bl);
                     txAt = millis();
                     g_stats.retransmits++;
@@ -1071,7 +1107,7 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
     }
 }
 void pollBusEvents(WiFiClient& cli, lgw::Crypto* cr, uint32_t& lgwIdx) {
-    if (!Serial2.available()) return;
+    if (!busA.available()) return;
     uint8_t rb[256]; size_t rn = busRead(rb, sizeof(rb), 10);
     if (g_debugBus && rn) dbgHex("BUS-RX(evt)", rb, rn);
     for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START) {
@@ -1374,7 +1410,7 @@ static bool busTxAck(uint32_t target, const uint8_t* data, uint8_t len,
     uint8_t out[300];
     size_t n = hmw::buildFrame(target, 0x18, hmw::CENTRAL, data, len, out, true);
     for (uint8_t t = 0; t < tries; t++) {
-        while (Serial2.available()) Serial2.read();
+        busA.drain();
         busSend(out, n);
         uint8_t rb[300];
         size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
@@ -1469,7 +1505,7 @@ static uint8_t busQuery(uint32_t target, uint8_t cmd, uint8_t* out, uint8_t outm
     uint8_t frame[32];
     size_t n = hmw::buildFrame(target, 0x18, hmw::CENTRAL, &cmd, 1, frame, true);
     for (uint8_t t = 0; t < 3; t++) {
-        while (Serial2.available()) Serial2.read();
+        busA.drain();
         busSend(frame, n);
         uint8_t rb[128];
         size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
@@ -1520,8 +1556,7 @@ void runGateway() {
 #if SELF_DEVICE_ENABLE
     encodeSelfEeprom();          // EEPROM-Abbild aus der Config aufbauen, bevor die CCU liest
 #endif
-    if (CFG.rs485De >= 0) { pinMode(CFG.rs485De, OUTPUT); busTx(false); }   // Idle = Empfangen (respektiert Invert)
-    Serial2.begin(BUS_BAUD, SERIAL_8E1, CFG.rs485Rx, CFG.rs485Tx);   // HMW-Bus = 8E1 (even parity)! Strenge HW-UARTs (z.B. ATmega32A) verwerfen sonst jeden Frame
+    busA.begin(CFG.rs485Rx, CFG.rs485Tx, CFG.rs485De, CFG.rs485DeInv, BUS_BAUD);
     lgw::lanKey(CFG.passphrase.c_str(), aesKey);
 
     if (!netStart()) {
