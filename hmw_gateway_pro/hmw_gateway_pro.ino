@@ -125,6 +125,34 @@ uint32_t        lastQueryAddr = 0;       // Ziel der letzten Unicast-Abfrage (De
 uint32_t        lastQueryMs   = 0;
 // (Zeitpunkt des letzten Bus-Bytes liegt jetzt pro Port in BusPort::lastRxMs)
 
+// --- Bus-Betriebsart und Ringzustand ---------------------------------------------------
+// Im geschlossenen Ring ist alles EIN elektrisches Segment: was auf A rausgeht, kommt ueber
+// die Schleife auf B wieder an. Bleibt dieses Echo aus, ist die Leitung unterbrochen. Erst
+// dann duerfen beide Ports senden (zwei getrennte Stiche) -- im geschlossenen Ring wuerde
+// gleichzeitiges Treiben beider Enden denselben Draht kollidieren lassen.
+enum : uint8_t { BUSMODE_SINGLE = 0, BUSMODE_RING = 1, BUSMODE_SPLIT = 2 };
+enum : uint8_t { RING_UNKNOWN = 0, RING_CLOSED = 1, RING_BROKEN = 2 };
+volatile uint8_t g_ringState = RING_UNKNOWN;
+uint8_t  g_ringMiss = 0, g_ringOk = 0;   // aufeinanderfolgende Fehl-/Treffer (Hysterese)
+uint32_t g_ringChangedMs = 0;            // Zeitpunkt des letzten Zustandswechsels
+
+inline bool busBActive() { return CFG.busMode != BUSMODE_SINGLE; }
+// Duerfen gerade BEIDE Ports treiben? Genau dann, wenn sie elektrisch getrennt sind:
+// im Split-Betrieb immer, im Ring nur bei erkanntem Bruch.
+inline bool bothPortsMayDrive() {
+    return CFG.busMode == BUSMODE_SPLIT ||
+           (CFG.busMode == BUSMODE_RING && g_ringState == RING_BROKEN);
+}
+inline const char* ringStateName() {
+    if (!busBActive())                return "ein Bus";
+    if (CFG.busMode == BUSMODE_SPLIT) return "zwei getrennte Straenge";
+    switch (g_ringState) {
+        case RING_CLOSED: return "Ring geschlossen";
+        case RING_BROKEN: return "RING UNTERBROCHEN";
+        default:          return "Ring wird geprueft ...";
+    }
+}
+
 // --- Frame-Tap: decodierte Bus-Telegramme fuer den Live-Sniffer (/sniffer) + Zaehler.
 //     Geschrieben aus dem Gateway-Loop (Tap-Aufrufe unten), gelesen vom Async-Web-Task.
 FrameTap        Tap;
@@ -317,11 +345,25 @@ String formHtml() {
     h += "<label>FW-Version (dez oder 0x&hellip;)</label><input name=selffw value='" + String(CFG.selfFw) +
          "'><small>aktuell 0x" + String(CFG.selfFw, HEX) + "</small>";
     h += "<label>Seriennummer (genau 10 Zeichen)</label><input name=selfser maxlength=10 value='" + esc(CFG.selfSerial) + "'>";
-    h += "<label>Bus-Betriebsart (noch ohne Wirkung &ndash; kommt mit Dual-Bus)</label><select name=busmode>";
+    h += F("<h2>Zweiter Bus (Ring / Split)</h2>");
+    h += "<label>Betriebsart</label><select name=busmode>";
     { const char* bm[3] = { "ein Bus (SINGLE)", "Ring (RING)", "zwei getrennte Str&auml;nge (SPLIT)" };
       for (uint8_t i = 0; i < 3; i++)
           h += "<option value=" + String(i) + (CFG.busMode == i ? " selected" : "") + ">" + bm[i] + "</option>"; }
-    h += F("</select>");
+    h += F("</select><small>Ring: beide Klemmen sind die zwei Enden <b>einer</b> Schleife. Bricht sie, "
+           "senden automatisch beide Str&auml;nge. Split: zwei dauerhaft getrennte Linien.</small>");
+    h += "<label>Bus B RX-Pin</label><input name=busrx2 type=number value='" + String(CFG.rs485Rx2) + "'>";
+    h += "<label>Bus B TX-Pin</label><input name=bustx2 type=number value='" + String(CFG.rs485Tx2) + "'>";
+    h += "<label>Bus B DE/RE-Pin (&minus;1 = Auto-Direction-Modul)</label><input name=busde2 type=number value='" +
+         String(CFG.rs485De2) + "'>";
+    h += "<label><input type=checkbox name=businv2 " + String(CFG.rs485De2Inv ? "checked" : "") +
+         "> Bus B DE invertiert</label>";
+    h += "<label>Ring: Echo-Fenster (ms)</label><input name=ringecho type=number value='" + String(CFG.ringEchoMs) +
+         "'><small>So lange wird nach dem Senden auf Bus B auf das eigene Frame gewartet.</small>";
+    h += "<label>Ring: fehlende Echos bis &bdquo;unterbrochen&ldquo;</label><input name=ringbrk type=number value='" +
+         String(CFG.ringBreakN) + "'>";
+    h += "<label>Ring: Echos bis &bdquo;wieder geschlossen&ldquo;</label><input name=ringheal type=number value='" +
+         String(CFG.ringHealM) + "'>";
     h += F("<h2>Web-Login</h2>");
     h += "<label>Passwort (leer = kein Login &middot; Benutzer = <b>admin</b>)</label><input name=webpass type=password value='" + esc(CFG.webPass) + "'>";
     h += F("<button type=submit>Speichern &amp; Neustart</button></form>"
@@ -352,6 +394,14 @@ String statusHtml() {
               " &middot; Typ " + String(CFG.selfType) + " (0x" + String(CFG.selfType, HEX) + ")" +
               " &middot; HW " + String(CFG.selfHw) + " &middot; FW 0x" + String(CFG.selfFw, HEX)
             : String("aus"));
+    if (busBActive()) {
+        row("Bus B", "RX " + String(CFG.rs485Rx2) + " / TX " + String(CFG.rs485Tx2) +
+                     (CFG.rs485De2 >= 0 ? " / DE " + String(CFG.rs485De2) : " / Auto-Dir"));
+        String rs = ringStateName();
+        if (CFG.busMode == BUSMODE_RING && g_ringState == RING_BROKEN)
+            rs = "<b style='color:var(--bad)'>" + rs + "</b>";
+        row("Bus-Zustand", rs);
+    }
     row("Carrier-Sense", CFG.useCarrierSense ? String(CFG.busIdleMs) + " ms Bus-Idle" : "aus");
     row("Sende-Wiederholung", CFG.useRetransmit ? String(CFG.sendRetries) + " Versuche" : "aus");
     row("AES",         CFG.useAes ? "an" : "aus");
@@ -452,6 +502,13 @@ void handleSave  (AsyncWebServerRequest* r) {
       s = pval(r,"selfser");  if (s.length()) CFG.selfSerial = s;
       s = pval(r,"busmode");  if (s.length()) { uint8_t m = (uint8_t)s.toInt(); if (m <= 2) CFG.busMode = m; }
     }
+    CFG.rs485Rx2    = clampP(pval(r,"busrx2").toInt(),  0, 39);
+    CFG.rs485Tx2    = clampP(pval(r,"bustx2").toInt(),  0, 33);   // GPIO34-39 sind input-only
+    CFG.rs485De2    = clampP(pval(r,"busde2").toInt(), -1, 33);
+    CFG.rs485De2Inv = r->hasParam("businv2", true);
+    CFG.ringEchoMs  = clampP(pval(r,"ringecho").toInt(), 5, 500);
+    CFG.ringBreakN  = clampP(pval(r,"ringbrk").toInt(),  1, 20);
+    CFG.ringHealM   = clampP(pval(r,"ringheal").toInt(), 1, 20);
     cfg::save(CFG);
     r->send(200, "text/html", pageHead("Gespeichert") +
             F("<meta http-equiv=refresh content='7;url=/'>"
@@ -785,9 +842,64 @@ struct BusPort {
 };
 
 BusPort busA(Serial2);                   // Bus A -- der bisherige (einzige) Anschluss
+BusPort busB(Serial1);                   // Bus B -- nur aktiv bei busMode RING/SPLIT
 
 inline void busTx(bool on) { busA.setTx(on); }
-void busSend(const uint8_t* data, size_t len) { busA.send(data, len); }
+
+// Ringzustand nach einem Sendevorgang fortschreiben (Hysterese: erst nach mehreren
+// gleichen Beobachtungen umschalten -- eine marginale Leitung soll nicht flattern).
+static void ringNoteEcho(bool heard) {
+    if (heard) { g_ringOk++;   g_ringMiss = 0; }
+    else       { g_ringMiss++; g_ringOk   = 0; }
+
+    uint8_t neu = g_ringState;
+    if (g_ringMiss >= CFG.ringBreakN) neu = RING_BROKEN;
+    else if (g_ringOk >= CFG.ringHealM) neu = RING_CLOSED;
+    if (neu == g_ringState) return;
+
+    g_ringState = neu;
+    g_ringChangedMs = millis();
+    Serial.printf("# RING: %s\n", neu == RING_BROKEN
+        ? "Echo bleibt aus -> Leitung unterbrochen, beide Straenge senden jetzt"
+        : "Echo wieder da -> Ring geschlossen, nur Bus A sendet");
+}
+
+// Sendet ein Master-Frame. Im RING-Modus wird dabei geprueft, ob das Frame ueber die
+// Schleife auf dem anderen Port ankommt; bei erkanntem Bruch (bzw. im SPLIT-Modus) geht
+// es zusaetzlich auf Bus B, weil die beiden Stiche sich sonst nicht hoeren.
+static uint32_t g_ringTestMs = 0;        // letzter Echo-Test (Drosselung im Bruchfall)
+const uint32_t  RING_RETEST_MS = 2000;   // bei bekanntem Bruch nur alle 2 s nachfuehlen
+
+void busSend(const uint8_t* data, size_t len) {
+    if (!busBActive()) { busA.send(data, len); return; }      // SINGLE: exakt wie bisher
+
+    if (CFG.busMode == BUSMODE_SPLIT) {                      // dauerhaft getrennte Straenge
+        busA.send(data, len);
+        busB.send(data, len);
+        return;
+    }
+
+    // --- RING ---------------------------------------------------------------------
+    // Immer zuerst A senden. Kommt das Frame ueber die Schleife auf B an, ist der Ring
+    // geschlossen -- dann haben die Geraete "hinter B" es bereits gehoert und B darf NICHT
+    // zusaetzlich senden (beide Enden treiben sonst denselben Draht). Bleibt das Echo aus,
+    // ist die Leitung unterbrochen und der zweite Stich muss separat bedient werden.
+    // Ein Frame geht so nie doppelt auf denselben Strang.
+    bool test = (g_ringState != RING_BROKEN) || (millis() - g_ringTestMs >= RING_RETEST_MS);
+
+    busB.drain();                                            // Altbestand vor dem Test weg
+    busA.send(data, len);
+
+    if (!test) { busB.send(data, len); return; }             // Bruch bekannt -> ohne Wartezeit
+
+    g_ringTestMs = millis();
+    uint32_t t0 = millis();
+    while (!busB.available() && millis() - t0 < CFG.ringEchoMs) { /* Echo abwarten */ }
+    bool heard = busB.available();
+    busB.drain();                                            // Echo verwerfen, ist kein Bus-Event
+    if (!heard) busB.send(data, len);                        // getrennt -> zweiten Stich bedienen
+    ringNoteEcho(heard);
+}
 // CSMA/CA Carrier-Sense vor einem Master-Sendevorgang: wartet, bis der Bus mind.
 // CFG.busIdleMs am Stueck still war (max. BUS_CS_MAX_WAIT_MS), danach kurzer Zufalls-
 // Backoff gegen zeitgleichen Zugriff. NUR im CMD_SEND-Pfad aufrufen -- NICHT vor
@@ -1557,6 +1669,13 @@ void runGateway() {
     encodeSelfEeprom();          // EEPROM-Abbild aus der Config aufbauen, bevor die CCU liest
 #endif
     busA.begin(CFG.rs485Rx, CFG.rs485Tx, CFG.rs485De, CFG.rs485DeInv, BUS_BAUD);
+    if (busBActive()) {
+        busB.begin(CFG.rs485Rx2, CFG.rs485Tx2, CFG.rs485De2, CFG.rs485De2Inv, BUS_BAUD);
+        Serial.printf("# Bus B aktiv: RX%d/TX%d/%s -- Betriebsart %s\n",
+                      CFG.rs485Rx2, CFG.rs485Tx2,
+                      CFG.rs485De2 >= 0 ? "DE" : "Auto-Dir",
+                      CFG.busMode == BUSMODE_RING ? "Ring" : "zwei getrennte Straenge");
+    }
     lgw::lanKey(CFG.passphrase.c_str(), aesKey);
 
     if (!netStart()) {

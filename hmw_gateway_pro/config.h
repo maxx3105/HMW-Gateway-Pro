@@ -71,9 +71,22 @@ struct GwConfig {
     uint8_t  selfHw      = 0x00;          // HW-Version (Antwort auf 'h')
     uint16_t selfFw      = 0x0102;        // FW-Version (Antwort auf 'v')
     String   selfSerial  = "LGW0000001";  // Seriennummer (Antwort auf 'n'), GENAU 10 Zeichen
-    // Bus-Betriebsart: 0=SINGLE (ein Bus), 1=RING, 2=SPLIT. Wird schon gespeichert und ist in
-    // der CCU einstellbar; WIRKSAM erst mit dem Dual-Bus-Umbau (siehe DUAL-BUS-KONZEPT.md).
+    // --- Zweiter Busanschluss (Ring/Split, siehe DUAL-BUS-KONZEPT.md) ---
+    // Bus-Betriebsart: 0=SINGLE (ein Bus, Bus B ungenutzt), 1=RING, 2=SPLIT.
     uint8_t  busMode     = 0;
+    // Pins Bus B. Default fuer Auto-Direction-Module (XY-K485 o.ae.): kein DE noetig.
+    // Am ESP32-ETH01 sind IO14/IO4 frei und unkritisch; IO12 waere als RX unbrauchbar
+    // (MTDI-Strapping, Bus-Idle liegt HIGH), als DE dagegen ideal.
+    int8_t   rs485Rx2    = 14;
+    int8_t   rs485Tx2    = 4;
+    int8_t   rs485De2    = -1;            // -1 = Auto-Direction-Modul (kein DE-Pin)
+    bool     rs485De2Inv = false;
+    // Ring-Ueberwachung: im geschlossenen Ring muss jedes auf A gesendete Frame auf B
+    // ankommen. Bleibt das N-mal aus -> Bruch; kommt es M-mal wieder -> Ring geheilt.
+    // Getrennte Schwellen = Hysterese gegen Flattern auf einer marginalen Leitung.
+    uint16_t ringEchoMs  = 30;            // Zeitfenster fuer das Echo auf dem anderen Port
+    uint8_t  ringBreakN  = 3;             // fehlende Echos bis "Ring gebrochen"
+    uint8_t  ringHealM   = 5;             // erfolgreiche Echos bis "Ring wieder zu"
     bool     valid       = false;         // schon konfiguriert?
 };
 
@@ -115,6 +128,13 @@ inline void load(GwConfig& c) {
     c.selfFw      = p.getUShort("selffw", 0x0102);
     c.selfSerial  = p.getString("selfser", "LGW0000001");
     c.busMode     = p.getUChar("busmode", 0);
+    c.rs485Rx2    = p.getChar("busrx2", 14);
+    c.rs485Tx2    = p.getChar("bustx2", 4);
+    c.rs485De2    = p.getChar("busde2", -1);
+    c.rs485De2Inv = p.getBool("businv2", false);
+    c.ringEchoMs  = p.getUShort("ringecho", 30);
+    c.ringBreakN  = p.getUChar("ringbrk", 3);
+    c.ringHealM   = p.getUChar("ringheal", 5);
     p.end();
 }
 
@@ -153,6 +173,13 @@ inline void save(const GwConfig& c) {
     p.putUShort("selffw", c.selfFw);
     p.putString("selfser", c.selfSerial);
     p.putUChar("busmode", c.busMode);
+    p.putChar("busrx2", c.rs485Rx2);
+    p.putChar("bustx2", c.rs485Tx2);
+    p.putChar("busde2", c.rs485De2);
+    p.putBool("businv2", c.rs485De2Inv);
+    p.putUShort("ringecho", c.ringEchoMs);
+    p.putUChar("ringbrk", c.ringBreakN);
+    p.putUChar("ringheal", c.ringHealM);
     p.putBool("valid", true);
     p.end();
 }
