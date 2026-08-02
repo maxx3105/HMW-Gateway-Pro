@@ -27,6 +27,19 @@ als wartbares „Gerät" mit Config-Portal, OTA, Status-Webseite und Watchdog.
   (Typ/FW/Serial), byte-genauem Verify und Fortschrittsanzeige.
 - **Status-Webseite** (`/`) — RSSI, IP, CCU-Status, gefundene Geräte, letztes Bus-Event,
   Uptime, freier Heap; Auto-Refresh.
+- **Live-Sniffer** (`/sniffer`) — decodierte Bus-Telegramme in Echtzeit (Richtung,
+  Ziel/Quelle, Control, Nutzdaten) statt roher Hexdumps, inkl. Zähler für RX/TX,
+  CRC-Fehler und letzte Antwortzeit. Auto-Refresh, Pause und „Leeren" — ein sauberer
+  Anlern-Mitschnitt ohne USB, gestörte Frames (CRC-Fehler) werden rot mitgeführt.
+- **Telegramm-Aufzeichnung + Download** (`/capture`) — Start/Stopp eines RAM-Mitschnitts
+  (linear, füllt sich von vorne → der Anfang bleibt erhalten) mit Download als
+  tab-getrennte `.txt` (Excel/Editor-freundlich). Zusätzlich Schnell-Download der letzten
+  Telegramme direkt aus dem Sniffer-Ring — ohne Aufzeichnung, jederzeit. Der Puffer wird
+  erst beim Start angelegt (kein RAM-Verbrauch im Ruhezustand).
+- **Statistik / Timing-Analyse** (`/stats`) — Telegramm-Aufkommen pro Art
+  (SEND/ACK/EVENT/RESP) mit Ø-Rate, **CRC-Fehlerrate**, Unicast-**Antwort-Erfolgsquote**
+  (beantwortet / ohne Antwort / Retransmits) und Antwortzeiten (min/max/Ø/letzte) —
+  gezielt für die Diagnose von RS485-Bus-Qualität. Zähler rücksetzbar.
 - **Watchdog** (`esp_task_wdt`).
 - **AES abschaltbar** (für FHEM-Klartext-Betrieb).
 - **WLAN oder Ethernet** — per Haken in der Konfiguration; Ethernet (LAN8720, z. B.
@@ -99,6 +112,8 @@ Ideal für Entwicklung und für Setups **ganz ohne CCU**.
 | `hmw_gateway_pro/config.h` | Persistente Konfiguration im NVS (`Preferences`) |
 | `hmw_gateway_pro/hmw_protocol.h` | Bus-Codec (CRC16 `0x1002`, FC-Escaping, Frame-Bau/-Parsing) — header-only |
 | `hmw_gateway_pro/hmw_lgw.h` | LAN-Schicht (LGW-Frames, Bridge-Übersetzung, AES-128-CFB via mbedTLS) — header-only |
+| `hmw_gateway_pro/frame_tap.h` | Frame-Tap: Ringpuffer decodierter Bus-Telegramme + Zähler (Live-Sniffer), optionaler Sink — header-only |
+| `hmw_gateway_pro/capture_log.h` | Telegramm-Aufzeichnung: linearer RAM-Puffer + Zeilen-Formatierer (Recorder/Download) — header-only |
 
 ## Build
 

@@ -25,18 +25,25 @@
 #include "config.h"
 #include "hmw_protocol.h"
 #include "hmw_lgw.h"
+#include "frame_tap.h"
+#include "capture_log.h"
 #include "log_tee.h"
 
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.2.2"
+#define FW_VERSION "1.3.0"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
 //     .bin-Name folgt dem CI-Muster hmw-gateway-pro-<version>.bin.
 #define GH_OWNER "maxx3105"
 #define GH_REPO  "HMW-Gateway-Pro"
+
+// Aufzeichnung (/capture): Groesse des RAM-Mitschnitt-Puffers. malloc erst bei "Start",
+// im Ruhezustand 0 Byte -> kein Dauerverbrauch. ~32 KB fassen mehrere hundert decodierte
+// Telegramme -- genug fuer einen kompletten Anlern-Mitschnitt.
+#define REC_CAPACITY (32u * 1024u)
 
 // Web-Ring-Log: 1 = aktiv (jedes Serial.print* wird zusaetzlich in einen 8-KB-RAM-Ring
 // gespiegelt, abrufbar unter /log -- Anlernmitschnitt ohne USB), 0 = aus (nur UART0).
@@ -104,6 +111,35 @@ char            lastEvent[48] = "-";
 uint32_t        lastQueryAddr = 0;       // Ziel der letzten Unicast-Abfrage (De-Dup fuer spurious 'e')
 uint32_t        lastQueryMs   = 0;
 volatile uint32_t busLastRxMs = 0;       // millis() des letzten Bus-Bytes (Carrier-Sense)
+
+// --- Frame-Tap: decodierte Bus-Telegramme fuer den Live-Sniffer (/sniffer) + Zaehler.
+//     Geschrieben aus dem Gateway-Loop (Tap-Aufrufe unten), gelesen vom Async-Web-Task.
+FrameTap        Tap;
+CaptureLog      Capture;                 // RAM-Mitschnitt (Start/Stopp/Download), gespeist vom Tap-Sink
+
+// --- Bus-Statistik (/stats): Unicast-Zuverlaessigkeit + Antwortzeiten. Geschrieben aus
+//     dem Gateway-Loop (handleLan), gelesen vom Async-Web-Task. Einzelne volatile-Felder
+//     -> atomare 32-bit-Zugriffe, ein Schreiber. respMinMs startet auf "leer" (0xFFFFFFFF).
+struct BusStats {
+    volatile uint32_t queries     = 0;   // Unicast-ACK-Abfragen gesamt
+    volatile uint32_t answered    = 0;   // davon beantwortet
+    volatile uint32_t noAnswer    = 0;   // davon ohne Antwort (Timeout / NACK)
+    volatile uint32_t retransmits = 0;   // zusaetzliche Sendeversuche (attempt > 1)
+    volatile uint32_t respLastMs  = 0;   // letzte Antwortzeit
+    volatile uint32_t respMinMs   = 0xFFFFFFFF;
+    volatile uint32_t respMaxMs   = 0;
+    volatile uint32_t respSumMs   = 0;   // Summe -> Durchschnitt = respSumMs / answered
+    void onAnswer(uint32_t ms) {
+        respLastMs = ms; answered++; respSumMs += ms;
+        if (ms > respMaxMs) respMaxMs = ms;
+        if (ms < respMinMs) respMinMs = ms;
+    }
+    void reset() {
+        queries = 0; answered = 0; noAnswer = 0; retransmits = 0;
+        respLastMs = 0; respMaxMs = 0; respSumMs = 0; respMinMs = 0xFFFFFFFF;
+    }
+};
+BusStats        g_stats;
 
 // --- Auto-Update-Status (Web-UI liest; loop schreibt). char[] statt String, weil
 //     cross-task gelesen -> kein Realloc (konsistent mit lastEvent). ---
@@ -257,7 +293,7 @@ String formHtml() {
            "<h2>Diagnose</h2>");
     h += g_debugBus ? F("<p>Bus-Debug: <b>AN</b> (Bus-Hexdumps im Log) &middot; <a href='/config?debug=0'>ausschalten</a></p>")
                     : F("<p>Bus-Debug: <b>aus</b> &middot; <a href='/config?debug=1'>einschalten</a> (Bus-Hexdumps im Log)</p>");
-    h += F("<div class=links><a href=/>&larr; Status</a> &middot; <a href=/log>System-Log</a></div>");
+    h += F("<div class=links><a href=/>&larr; Status</a> &middot; <a href=/sniffer>Sniffer</a> &middot; <a href=/log>System-Log</a></div>");
     h += pageFoot();
     return h;
 }
@@ -294,7 +330,7 @@ String statusHtml() {
     row("Uptime",      ut);
     row("Freier Heap", String(ESP.getFreeHeap()) + " B");
     row("Firmware",    F("v" FW_VERSION " &middot; " __DATE__ " " __TIME__));
-    h += F("</table><div class=links><a href=/config>Konfiguration &auml;ndern</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/update>Firmware-Update</a> &middot; <a href=/flash>Ger&auml;t flashen</a></div>");
+    h += F("</table><div class=links><a href=/config>Konfiguration &auml;ndern</a> &middot; <a href=/sniffer>Sniffer</a> &middot; <a href=/capture>Aufzeichnung</a> &middot; <a href=/stats>Statistik</a> &middot; <a href=/flash>Ger&auml;t flashen</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/update>Firmware-Update</a></div>");
     h += pageFoot();
     return h;
 }
@@ -367,6 +403,210 @@ void handleSave  (AsyncWebServerRequest* r) {
     rebootPending = true; rebootAt = millis() + 1200;
 }
 
+// ---- Live-Sniffer (/sniffer): decodierte Bus-Telegramme aus dem Frame-Tap ---------- //
+static String sniffAddr(uint32_t a, bool has) {
+    if (!has)                return String("&mdash;");
+    if (a == hmw::CENTRAL)   return String("CCU");
+    if (a == hmw::BROADCAST) return String("ALL");
+    char b[9]; snprintf(b, sizeof(b), "%08lX", (unsigned long)a); return String(b);
+}
+static const char* sniffKind(uint8_t k) {
+    switch (k) {
+        case FrameTap::SEND:   return "&rarr; SEND";   // wir -> Bus (CCU-Kommando)
+        case FrameTap::EVENT:  return "&larr; EVT";    // Bus -> wir (spontanes Geraete-Event)
+        case FrameTap::RESP:   return "&larr; RSP";    // Bus -> wir (Antwort auf Unicast)
+        case FrameTap::ACK:    return "&rarr; ACK";    // wir -> Bus (Bus-Quittung)
+        case FrameTap::BADCRC: return "&#10007; CRC";  // empfangen, CRC falsch
+        default:               return "?";
+    }
+}
+static const char* sniffColor(uint8_t k) {   // dezente Farbe pro Art (TX blau, RX gruen/teal, ACK grau, Fehler rot)
+    switch (k) {
+        case FrameTap::SEND:   return "#2c6fb3";
+        case FrameTap::EVENT:  return "#2e7d32";
+        case FrameTap::RESP:   return "#0d7d7d";
+        case FrameTap::ACK:    return "#6b7280";
+        case FrameTap::BADCRC: return "#c62828";
+        default:               return "#23272e";
+    }
+}
+String sniffHtml(bool paused) {
+    String h = pageHead("HMW-LGW Sniffer", paused ? 0 : 3);
+    // Eigenes, kompaktes Tabellen-Styling nur fuer den Mitschnitt (setzt die globale
+    // td:first-child-Breite/Farbe zurueck; Kopfzeile bleibt bei langer Liste sichtbar).
+    h += F("<style>#sn td{width:auto;color:inherit;padding:.15em .4em;white-space:nowrap}"
+           "#sn td:last-child{white-space:normal;word-break:break-all}"
+           "#sn tr:first-child td{color:var(--mut);position:sticky;top:0;background:var(--card)}</style>"
+           "<h2>Live-Sniffer</h2><table>");
+    h += "<tr><td>Frames RX / TX</td><td>" + String(Tap.rx()) + " / " + String(Tap.tx()) + "</td></tr>";
+    h += "<tr><td>CRC-Fehler</td><td>" + String(Tap.crcErr());
+    if (Tap.crcErr()) h += F(" <span class='badge bad'>Bus pr&uuml;fen</span>");
+    h += F("</td></tr>");
+    if (Tap.dropped()) h += "<tr><td>Verworfen (Last)</td><td>" + String(Tap.dropped()) + "</td></tr>";
+    h += "<tr><td>Letzte Antwortzeit</td><td>" +
+         (g_stats.answered ? String((uint32_t)g_stats.respLastMs) + " ms" : String("&mdash;")) + "</td></tr>";
+    h += F("</table><div class=links>");
+    h += paused ? F("<a href=/sniffer>&#8635; Live (3 s)</a>") : F("<a href='/sniffer?pause'>&#10073;&#10073; Pause</a>");
+    h += F(" &middot; <a href=/sniffer>Aktualisieren</a> &middot; <a href='/sniffer?clear'>Leeren</a>"
+           " &middot; <a href=/capture>Aufzeichnung</a> &middot; <a href=/stats>Statistik</a> &middot; <a href=/log>System-Log</a> &middot; <a href=/>&larr; Status</a></div>");
+
+    // Eintraege unter dem Mutex herauskopieren, danach lockfrei formatieren (wie beim LogTee).
+    FrameTap::Entry* buf = (FrameTap::Entry*)malloc(sizeof(FrameTap::Entry) * FrameTap::RING);
+    size_t n = buf ? Tap.copyOut(buf, FrameTap::RING) : 0;
+    h += F("<div id=sn style='max-height:66vh;overflow:auto;margin-top:.8em;border:1px solid var(--line);"
+           "border-radius:8px;font-family:ui-monospace,monospace;font-size:.75em'>"
+           "<table><tr><td>Zeit&nbsp;s</td><td>Typ</td><td>Ziel</td><td>Quelle</td><td>Ctrl</td><td>Len</td><td>Daten</td></tr>");
+    if (!buf)    h += F("<tr><td colspan=7>Speicher knapp &ndash; sp&auml;ter erneut versuchen</td></tr>");
+    else if (!n) h += F("<tr><td colspan=7>noch keine Telegramme &ndash; sobald die CCU pollt oder ein Ger&auml;t sendet, f&uuml;llt sich die Liste</td></tr>");
+    for (size_t i = 0; i < n; i++) {
+        const FrameTap::Entry& e = buf[i];
+        char t[16];  snprintf(t,  sizeof(t),  "%lu.%03lu", (unsigned long)(e.ms / 1000), (unsigned long)(e.ms % 1000));
+        char cb[3];  snprintf(cb, sizeof(cb), "%02X", e.control);
+        String data; char hb[4];
+        for (uint8_t k = 0; k < e.stored; k++) { snprintf(hb, sizeof(hb), "%02X ", e.data[k]); data += hb; }
+        if (e.stored < e.dataLen) data += F("&hellip;");   // Rest abgeschnitten (Frame laenger als gespeichert)
+        bool bad = (e.kind == FrameTap::BADCRC);
+        h += "<tr style='color:" + String(sniffColor(e.kind)) + "'><td>" + String(t) +
+             "</td><td>" + String(sniffKind(e.kind)) +
+             "</td><td>" + sniffAddr(e.target, !bad) +
+             "</td><td>" + sniffAddr(e.sender, e.hasSender) +
+             "</td><td>" + (bad ? String("&mdash;") : String(cb)) +
+             "</td><td>" + String(e.dataLen) +
+             "</td><td>" + (data.length() ? data : String("&mdash;")) + "</td></tr>";
+    }
+    free(buf);
+    h += F("</table></div>"
+           "<script>var e=document.getElementById('sn');if(e)e.scrollTop=e.scrollHeight;</script>");
+    h += pageFoot();
+    return h;
+}
+void handleSniffer(AsyncWebServerRequest* r) {
+    if (authFail(r)) return;
+    if (r->hasParam("clear")) { Tap.clear(); r->redirect("/sniffer"); return; }
+    r->send(200, "text/html", sniffHtml(r->hasParam("pause")));
+}
+
+// ---- Aufzeichnung (/capture): RAM-Mitschnitt mit Download ------------------------- //
+// Tap-Sink: laeuft im loopTask, haengt jede Telegramm-Zeile an den Recorder an (nur
+// wenn aktiv -- sonst sofortiger Rueckkehr, kein Overhead). RAM-Append (Mikrosekunden),
+// daher timing-unkritisch; der Sniffer-Ring bleibt davon unberuehrt.
+void captureSink(const FrameTap::Entry& e) {
+    if (!Capture.recording()) return;
+    char line[220];
+    size_t n = captureEntryLine(e, line, sizeof(line));
+    Capture.append(line, n);
+}
+// Kopfzeilen fuer die Download-Datei (Version + Spaltenkopf, tab-getrennt).
+String captureHeader() {
+    return String(F("# HMW-Gateway-Pro Telegramm-Mitschnitt  fw " FW_VERSION "\n"
+                    "# t(s)\ttyp\tziel\tquelle\tctrl\tlen\tdaten(hex)  (~ = gekuerzt)\n"));
+}
+String captureHtml(bool memErr) {
+    bool rec = Capture.recording();
+    String h = pageHead("HMW-LGW Aufzeichnung", rec ? 3 : 0);   // waehrend der Aufnahme Groesse mitlaufen lassen
+    h += F("<h2>Aufzeichnung</h2>");
+    if (memErr) h += F("<p><span class='badge bad'>zu wenig RAM</span> &ndash; Puffer konnte nicht angelegt werden.</p>");
+    h += F("<table><tr><td>Status</td><td>");
+    if (rec)                     h += F("<span class='badge ok'>l&auml;uft</span>");
+    else if (Capture.full())     h += F("<span class='badge bad'>Puffer voll &ndash; gestoppt</span>");
+    else if (Capture.hasData())  h += F("gestoppt");
+    else                         h += F("aus");
+    h += F("</td></tr>");
+    if (Capture.cap()) {
+        char b[48]; snprintf(b, sizeof(b), "%u / %u Bytes", (unsigned)Capture.len(), (unsigned)Capture.cap());
+        h += "<tr><td>Puffer</td><td>" + String(b) + "</td></tr>";
+    }
+    h += F("</table><div class=links>");
+    if (!rec) h += F("<form method=POST action=/capture/start style='display:inline'><button type=submit>Aufzeichnung starten</button></form>");
+    else      h += F("<form method=POST action=/capture/stop style='display:inline'><button type=submit>Stoppen</button></form>");
+    if (Capture.hasData())
+        h += F(" &middot; <a href=/capture/download>&#8681; Download (.txt)</a> &middot; "
+               "<form method=POST action=/capture/discard style='display:inline'>"
+               "<button type=submit style='background:var(--bad);margin-top:0'>Verwerfen</button></form>");
+    h += F("</div>");
+    h += "<h2>Schnell-Download</h2><p>Die letzten " + String((unsigned)FrameTap::RING) +
+         " Telegramme direkt aus dem Sniffer-Ring &ndash; ohne Aufzeichnung, jederzeit.</p>";
+    h += F("<div class=links><a href=/capture.txt>&#8681; Letzte Telegramme (.txt)</a></div>"
+           "<div class=links><a href=/sniffer>&larr; Sniffer</a> &middot; <a href=/stats>Statistik</a> &middot; <a href=/>Status</a></div>");
+    h += pageFoot();
+    return h;
+}
+void handleCapture(AsyncWebServerRequest* r) {
+    if (authFail(r)) return;
+    r->send(200, "text/html", captureHtml(r->hasParam("err")));
+}
+// Download eines Textmitschnitts als Datei-Anhang. txtBody wird vom Aufrufer gebaut.
+static void sendTxtAttachment(AsyncWebServerRequest* r, const String& body, const char* fname) {
+    AsyncWebServerResponse* resp = r->beginResponse(200, "text/plain; charset=utf-8", body);
+    String cd = "attachment; filename=\"" + String(fname) + "\"";
+    resp->addHeader("Content-Disposition", cd.c_str());
+    r->send(resp);
+}
+void handleCaptureDownload(AsyncWebServerRequest* r) {   // aufgezeichneter Puffer
+    if (authFail(r)) return;
+    sendTxtAttachment(r, captureHeader() + Capture.snapshot(), "hmw-capture.txt");
+}
+void handleCaptureTxt(AsyncWebServerRequest* r) {        // Schnell-Dump des Sniffer-Rings
+    if (authFail(r)) return;
+    String body = captureHeader();
+    FrameTap::Entry* buf = (FrameTap::Entry*)malloc(sizeof(FrameTap::Entry) * FrameTap::RING);
+    size_t n = buf ? Tap.copyOut(buf, FrameTap::RING) : 0;
+    char line[220];
+    for (size_t i = 0; i < n; i++) { captureEntryLine(buf[i], line, sizeof(line)); body += line; }
+    free(buf);
+    sendTxtAttachment(r, body, "hmw-ring.txt");
+}
+
+// ---- Statistik / Timing-Analyse (/stats) ----------------------------------------- //
+// Aufsatz auf die Frame-Tap-Zaehler (pro Art) + die Unicast-Statistik (g_stats):
+// Telegramm-Aufkommen, CRC-Fehlerrate, Antwort-Erfolgsquote und Antwortzeiten.
+String statsHtml() {
+    String h = pageHead("HMW-LGW Statistik", 5);   // 5 s Auto-Refresh
+    uint32_t up = (millis() - bootMs) / 1000; if (!up) up = 1;
+    uint32_t total = Tap.rx() + Tap.tx();
+    auto row = [&](const String& k, const String& v) { h += "<tr><td>" + k + "</td><td>" + v + "</td></tr>"; };
+    char b[40];
+
+    h += F("<h2>Telegramme</h2><table>");
+    row(F("SEND &rarr; Bus"),  String(Tap.kindCount(FrameTap::SEND)));
+    row(F("ACK &rarr; Bus"),   String(Tap.kindCount(FrameTap::ACK)));
+    row(F("EVENT &larr; Bus"), String(Tap.kindCount(FrameTap::EVENT)));
+    row(F("RESP &larr; Bus"),  String(Tap.kindCount(FrameTap::RESP)));
+    row(F("Gesamt RX / TX"),   String(Tap.rx()) + " / " + String(Tap.tx()));
+    snprintf(b, sizeof(b), "%lu /min", (unsigned long)((uint64_t)total * 60 / up));
+    row(F("&Oslash; Rate"),    b);
+    h += F("</table><h2>Fehler &amp; Zuverl&auml;ssigkeit</h2><table>");
+    { String v = String(Tap.crcErr());
+      uint32_t denom = Tap.rx() + Tap.crcErr();
+      if (denom) { snprintf(b, sizeof(b), " (%lu&permil;)", (unsigned long)((uint64_t)Tap.crcErr() * 1000 / denom)); v += b; }
+      if (Tap.crcErr()) v += F(" <span class='badge bad'>Bus pr&uuml;fen</span>");
+      row(F("CRC-Fehler"), v); }
+    row(F("Unicast-Abfragen"), String(g_stats.queries));
+    { String v = String(g_stats.answered);
+      if (g_stats.queries) { snprintf(b, sizeof(b), " (%lu%%)", (unsigned long)((uint64_t)g_stats.answered * 100 / g_stats.queries)); v += b; }
+      row(F("davon beantwortet"), v); }
+    { String v = String(g_stats.noAnswer);
+      if (g_stats.noAnswer) v += F(" <span class='badge bad'>?</span>");
+      row(F("ohne Antwort"), v); }
+    row(F("Retransmits"), String(g_stats.retransmits));
+    if (Tap.dropped()) row(F("Sniffer-Drops"), String(Tap.dropped()));
+    h += F("</table><h2>Antwortzeit (Unicast)</h2><table>");
+    if (g_stats.answered) {
+        row(F("letzte"),    String((uint32_t)g_stats.respLastMs) + " ms");
+        row(F("min / max"), String((uint32_t)g_stats.respMinMs) + " / " + String((uint32_t)g_stats.respMaxMs) + " ms");
+        row(F("&Oslash;"),  String((uint32_t)(g_stats.respSumMs / g_stats.answered)) + " ms");
+    } else row(F("Antwortzeit"), String("&mdash; (noch keine)"));
+    h += F("</table><div class=links><a href='/stats?reset'>Z&auml;hler zur&uuml;cksetzen</a> &middot; "
+           "<a href=/sniffer>Sniffer</a> &middot; <a href=/capture>Aufzeichnung</a> &middot; <a href=/>&larr; Status</a></div>");
+    h += pageFoot();
+    return h;
+}
+void handleStats(AsyncWebServerRequest* r) {
+    if (authFail(r)) return;
+    if (r->hasParam("reset")) { Tap.resetCounters(); g_stats.reset(); r->redirect("/stats"); return; }
+    r->send(200, "text/html", statsHtml());
+}
+
 // System-Log-Seite: zeigt den RAM-Ring (Serial-Mirror). Fuer den Anlernmitschnitt:
 // vor dem Anlernen ueber "Leeren" zuruecksetzen, dann anlernen, dann hier mitlesen.
 void handleLog(AsyncWebServerRequest* r) {
@@ -376,7 +616,7 @@ void handleLog(AsyncWebServerRequest* r) {
     String h = pageHead("System-Log", paused ? 0 : 3);   // Standard: alle 3 s automatisch nachladen
     h += F("<h2>System-Log</h2><div class=links>");
     h += paused ? F("<a href=/log>&#8635; Live (3 s)</a>") : F("<a href='/log?pause'>&#10073;&#10073; Pause</a>");
-    h += F(" &middot; <a href=/log>Aktualisieren</a> &middot; <a href='/log?clear'>Leeren</a> &middot; <a href=/>&larr; Status</a></div>");
+    h += F(" &middot; <a href=/log>Aktualisieren</a> &middot; <a href='/log?clear'>Leeren</a> &middot; <a href=/sniffer>Sniffer</a> &middot; <a href=/>&larr; Status</a></div>");
     h += F("<pre id=lg style='white-space:pre-wrap;word-break:break-all;font-size:.78em;background:#111;color:#3f3;"
            "padding:.7em;border-radius:8px;max-height:70vh;overflow:auto;margin-top:.8em'>");
     h += esc(Logger.snapshot());
@@ -512,6 +752,7 @@ void busAck(uint32_t dev, uint8_t devControl) {
     size_t n = hmw::buildFrame(dev, ackCtrl, hmw::CENTRAL, nullptr, 0, out, true);
     dbgHex("BUS-TX(ack)", out, n);
     busSend(out, n);
+    Tap.add(FrameTap::ACK, dev, ackCtrl, true, hmw::CENTRAL, nullptr, 0, true);
 }
 bool busProbe(uint32_t prefix, uint8_t validBits) {
     uint8_t out[16];
@@ -555,6 +796,13 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
         dbgHex("BUS-TX(send)", bus, bl);
         busWaitIdle();                    // CSMA/CA: erst senden, wenn der Bus frei ist (falls aktiviert)
         busSend(bus, bl);
+        uint32_t txAt = millis();         // Sendezeitpunkt -> Antwortzeit-Messung im Unicast-Zweig
+        // Frame-Tap (TX): decodierte Felder direkt aus dem eingebetteten LAN-Payload
+        // (recv[4] ctrl sender[4] daten...), robust ohne Re-Parse des gebauten Frames.
+        if (plen >= 11)
+            Tap.add(FrameTap::SEND, lastQueryAddr, pl[6], true,
+                    ((uint32_t)pl[7]<<24)|((uint32_t)pl[8]<<16)|((uint32_t)pl[9]<<8)|pl[10],
+                    pl + 11, (uint8_t)(plen - 11), true);
         if (mode == lgw::MODE_UNICAST_ACK) {
             // Master-Retransmit wie hs485d/HM485_Protocol.pm (MAX_SEND_RETRY=3, Fenster =
             // CFG.ackWaitMs): kommt keine Antwort/kein ACK, dasselbe Frame erneut senden.
@@ -564,6 +812,7 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
             // Der 1. Sendevorgang ist oben schon erfolgt; ab Versuch 2 wird neu gesendet.
             uint8_t tries = CFG.useRetransmit ? CFG.sendRetries : 1;
             bool answered = false;
+            g_stats.queries++;
             for (uint8_t attempt = 1; attempt <= tries && !answered; attempt++) {
                 if (attempt > 1) {              // Wiederholung: Bus frei machen, Puffer leeren, gleiches Frame neu
                     if (g_debugBus) Serial.printf("# Retransmit %u/%u -> %08lX\n",
@@ -571,6 +820,8 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
                     busWaitIdle();
                     while (Serial2.available()) Serial2.read();
                     busSend(bus, bl);
+                    txAt = millis();
+                    g_stats.retransmits++;
                 }
                 uint8_t rb[256]; size_t rn = busReadResponse(rb, sizeof(rb), CFG.ackWaitMs, 20);
                 if (rn) dbgHex("BUS-RX(resp)", rb, rn);
@@ -579,10 +830,14 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
                 for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START || rb[i] == hmw::START_SHORT) {
                     hmw::Frame f;
                     bool isShort = (rb[i] == hmw::START_SHORT);
-                    bool ok = isShort ? hmw::parseSystemFrame(rb + i, rn - i, &f)
-                                      : hmw::parseFrame(rb + i, rn - i, &f);
+                    bool crcErr = false;
+                    bool ok = isShort ? hmw::parseSystemFrame(rb + i, rn - i, &f, &crcErr)
+                                      : hmw::parseFrame(rb + i, rn - i, &f, &crcErr);
                     if (ok) {
                         answered = true;
+                        g_stats.onAnswer(millis() - txAt);   // Round-Trip fuer die Timing-Analyse
+                        Tap.add(FrameTap::RESP, f.target, f.control, f.hasSender, f.sender,
+                                f.data, f.dataLen, true);
                         if (!isShort && f.hasSender && (f.control & 0x03) != 0x01) busAck(f.sender, f.control);
                         uint8_t rp[260]; uint8_t rpl = lgw::frameToResponse(f, rp);
                         sendLan(cli, cr, lan, lgw::lanEncode(idx, rp, rpl, lan));
@@ -590,9 +845,11 @@ void handleLan(WiFiClient& cli, lgw::Crypto* cr, uint8_t idx, const uint8_t* pl,
                             Serial.printf("# resp 'r' via %s ctrl=%02X len=%u\n",
                                           isShort ? "system" : "unicast", f.control, f.dataLen);
                     }
+                    else if (crcErr) Tap.badCrc(rb + i, rn - i);   // gestoerte Antwort sichtbar machen
                     break;
                 }
             }
+            if (!answered) g_stats.noAnswer++;
             if (!answered && CFG.useRetransmit && g_debugBus)
                 Serial.printf("# %08lX nach %u Versuchen ohne Antwort (NACK)\n",
                               (unsigned long)lastQueryAddr, tries);
@@ -628,7 +885,9 @@ void pollBusEvents(WiFiClient& cli, lgw::Crypto* cr, uint32_t& lgwIdx) {
     if (g_debugBus && rn) dbgHex("BUS-RX(evt)", rb, rn);
     for (size_t i = 0; i < rn; i++) if (rb[i] == hmw::START) {
         hmw::Frame f;
-        if (hmw::parseFrame(rb + i, rn - i, &f) && f.target == hmw::CENTRAL && f.hasSender) {
+        bool crcErr = false;
+        if (hmw::parseFrame(rb + i, rn - i, &f, &crcErr) && f.target == hmw::CENTRAL && f.hasSender) {
+            Tap.add(FrameTap::EVENT, f.target, f.control, f.hasSender, f.sender, f.data, f.dataLen, true);
             // De-Dup: Antwort des gerade unicast-abgefragten Geraets NICHT als spontanes
             // 'e' weiterreichen (kam schon als 'r'). Sonst deutet hs485d das Duplikat als
             // Re-Announce und verheddert sich in der Inklusion. Nur quittieren.
@@ -642,6 +901,7 @@ void pollBusEvents(WiFiClient& cli, lgw::Crypto* cr, uint32_t& lgwIdx) {
             else if (g_debugBus) Serial.printf("# (dup von %08lX unterdrueckt)\n", (unsigned long)f.sender);
             if ((f.control & 0x03) != 0x01) busAck(f.sender, f.control);
         }
+        else if (crcErr) Tap.badCrc(rb + i, rn - i);   // gestoertes Bus-Frame sichtbar machen
         break;
     }
 }
@@ -1046,6 +1306,21 @@ void runGateway() {
     webServer.on("/config", HTTP_GET, handleForm);
     webServer.on("/save", HTTP_POST, handleSave);
     webServer.on("/log", HTTP_GET, handleLog);
+    webServer.on("/sniffer", HTTP_GET, handleSniffer);
+    webServer.on("/capture", HTTP_GET, handleCapture);
+    webServer.on("/capture.txt", HTTP_GET, handleCaptureTxt);
+    webServer.on("/capture/download", HTTP_GET, handleCaptureDownload);
+    webServer.on("/capture/start", HTTP_POST, [](AsyncWebServerRequest* r) {
+        if (authFail(r)) return;
+        r->redirect(Capture.start(REC_CAPACITY) ? "/capture" : "/capture?err=mem");
+    });
+    webServer.on("/capture/stop", HTTP_POST, [](AsyncWebServerRequest* r) {
+        if (authFail(r)) return; Capture.stop(); r->redirect("/capture");
+    });
+    webServer.on("/capture/discard", HTTP_POST, [](AsyncWebServerRequest* r) {
+        if (authFail(r)) return; Capture.discard(); r->redirect("/capture");
+    });
+    webServer.on("/stats", HTTP_GET, handleStats);
     webServer.on("/update", HTTP_GET, [](AsyncWebServerRequest* r) {
         if (authFail(r)) return; r->send(200, "text/html", updateHtml()); });
     webServer.on("/update", HTTP_POST,
@@ -1133,6 +1408,9 @@ void setup() {
     Serial.begin(115200);
     bootMs = millis();
     Serial.printf("# HMW-LGW Firmware v%s (Build %s %s)\n", FW_VERSION, __DATE__, __TIME__);
+    Tap.begin();
+    Capture.begin();
+    Tap.setSink(captureSink);   // jeder Tap-Eintrag geht zusaetzlich in den Recorder (nur wenn aktiv)
     cfg::load(CFG);
     Serial.printf("# Config: valid=%d ssid=%s serial=%s port=%u aes=%d eth=%d bus=RX%d/TX%d/DE%d\n",
                   CFG.valid, CFG.ssid.c_str(), CFG.serial.c_str(), CFG.port, CFG.useAes,
