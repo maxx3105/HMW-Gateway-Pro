@@ -869,8 +869,11 @@ static void ringNoteEcho(bool heard) {
 // es zusaetzlich auf Bus B, weil die beiden Stiche sich sonst nicht hoeren.
 static uint32_t g_ringTestMs = 0;        // letzter Echo-Test (Drosselung im Bruchfall)
 const uint32_t  RING_RETEST_MS = 2000;   // bei bekanntem Bruch nur alle 2 s nachfuehlen
+static uint32_t g_lastBusTxMs = 0;       // letzter Sendevorgang (fuer den Leerlauf-Test)
+const uint32_t  RING_IDLE_TEST_MS = 10000;  // ohne Busverkehr alle 10 s selbst pruefen
 
 void busSend(const uint8_t* data, size_t len) {
+    g_lastBusTxMs = millis();
     if (!busBActive()) { busA.send(data, len); return; }      // SINGLE: exakt wie bisher
 
     if (CFG.busMode == BUSMODE_SPLIT) {                      // dauerhaft getrennte Straenge
@@ -951,6 +954,18 @@ size_t busReadResponse(uint8_t* buf, size_t maxlen, uint32_t firstWaitMs, uint32
 // len02-ACK an ein Geraet. Basis 0x19 + txSeqNum (Bits 6-5 des Geraete-Frames).
 // Das echte LGW quittiert jede adressierte Geraete-Antwort auf Bus-Ebene -- ohne
 // das sendet das Geraet 3x neu (ACKWAITTIME) und gibt auf. Aus hmw_bus._ack portiert.
+// Ring-Pruefung im Leerlauf. Ohne CCU-Verbindung sendet sonst niemand, und der Ringzustand
+// bliebe fuer immer unbekannt. Gesendet wird ein len02-ACK an die EIGENE Gateway-Adresse:
+// ein ACK erwartet keine Antwort, und die Adresse gehoert uns -- kein Geraet am Bus fuehlt
+// sich angesprochen. Die eigentliche Echo-Auswertung macht busSend().
+void ringIdleCheck() {
+    if (CFG.busMode != BUSMODE_RING) return;
+    if (millis() - g_lastBusTxMs < RING_IDLE_TEST_MS) return;
+    uint8_t out[16];
+    size_t n = hmw::buildFrame(CFG.selfAddr, 0x19, hmw::CENTRAL, nullptr, 0, out, true);
+    busSend(out, n);
+}
+
 void busAck(uint32_t dev, uint8_t devControl) {
     uint8_t ackCtrl = 0x19 | (devControl & 0x60);
     uint8_t out[16];
@@ -1288,7 +1303,7 @@ void handleClient(WiFiClient& cli) {
     uint8_t rx[640]; size_t rxlen = 0; uint32_t lgwIdx = 0x70;
     uint32_t lastRx = millis(); lastCcuRxMs = lastRx;
     while (cli.connected()) {
-        watchdogFeed(); ArduinoOTA.handle();
+        watchdogFeed(); ArduinoOTA.handle(); ringIdleCheck();
         // "Last connect wins": Will die CCU neu verbinden (hs485d-Neustart, Netzwechsel
         // oder lautlos weggebrochene Verbindung), wartet ihr SYN am Listen-Socket.
         // hasClient() akzeptiert es non-destruktiv (cached es fuer das naechste accept()
@@ -1842,6 +1857,7 @@ void loop() {
         Serial.println("# Netzwerk zurueck -> LGW-Server neu gestartet");
     }
     ArduinoOTA.handle();
+    ringIdleCheck();     // Ringzustand auch ohne CCU-Verbindung feststellen
     if (g_doCheckUpd) { g_doCheckUpd = false; updateCheck(); }   // blockierend, aber nur zwischen CCU-Sitzungen
     if (g_doInstall)  { g_doInstall  = false; updateInstall(); }
     if (g_doBusFlash) { g_doBusFlash = false; busFlashRun(); }     // Geraet ueber den Bus flashen (blockierend)
