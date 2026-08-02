@@ -32,7 +32,7 @@
 // --- Firmware-Version: erscheint auf der Status-Seite, im Footer JEDER Web-Seite und im
 //     Boot-Log. FW_VERSION = menschliche Version, __DATE__/__TIME__ = eindeutiger Build-
 //     Stempel -> geflashte Staende lassen sich nie verwechseln. Bei Aenderungen erhoehen.
-#define FW_VERSION "1.3.0-selftest"
+#define FW_VERSION "1.3.6-pre.1"
 
 // --- Auto-Update via GitHub Releases (oeffentliches Repo -> kein Token noetig).
 //     Das Gateway prueft das neueste Release und zieht die passende .bin per HTTPS.
